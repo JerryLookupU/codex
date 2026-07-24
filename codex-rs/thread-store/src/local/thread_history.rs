@@ -499,7 +499,10 @@ SET
                 WHERE thread_id = ?
                   AND turn_id = ?
                   AND item_type = 'agentMessage'
-                  AND item_json NOT LIKE '%"phase":%'
+                  AND (
+                    item_json LIKE '%"phase":null%'
+                    OR item_json NOT LIKE '%"phase":%'
+                  )
                 ORDER BY rollout_ordinal DESC
                 LIMIT 1
             )

@@ -3,6 +3,7 @@ use sqlx::Arguments;
 use sqlx::AssertSqlSafe;
 use sqlx::Encode;
 use sqlx::FromRow;
+use sqlx::Row as _;
 use sqlx::Type;
 use sqlx::any::AnyArguments;
 use sqlx::any::AnyRow;
@@ -15,6 +16,18 @@ use std::fmt::Write;
 pub type Pool = sqlx::AnyPool;
 pub type Connection = sqlx::AnyConnection;
 pub type Row = AnyRow;
+
+pub fn bool_from_row(row: &Row, column: &str) -> Result<bool, sqlx::Error> {
+    row.try_get::<bool, _>(column)
+        .or_else(|_| row.try_get::<i64, _>(column).map(|value| value != 0))
+}
+
+pub fn optional_bool_from_row(row: &Row, column: &str) -> Result<Option<bool>, sqlx::Error> {
+    row.try_get::<Option<bool>, _>(column).or_else(|_| {
+        row.try_get::<Option<i64>, _>(column)
+            .map(|value| value.map(|value| value != 0))
+    })
+}
 
 pub fn query(sql: &'static str) -> Query<'static, Any, AnyArguments> {
     sqlx::query::<Any>(AssertSqlSafe(numbered_placeholders(sql)))
@@ -119,17 +132,22 @@ impl QueryBuilder {
         self.push("VALUES ");
         let mut separated = self.separated(", ");
         for value in values {
+            separated.push_separator();
             separated.push_unseparated("(");
             let mut tuple = separated.reborrow();
             push_tuple(&mut tuple, value);
             separated.push_unseparated(")");
-            separated.needs_separator = true;
         }
         self
     }
 
     pub fn build(self) -> Query<'static, Any, AnyArguments> {
         sqlx::query_with::<Any, _>(AssertSqlSafe(self.sql), self.arguments)
+    }
+
+    #[cfg(test)]
+    pub fn sql(&self) -> &str {
+        &self.sql
     }
 
     pub fn build_query_as<O>(self) -> QueryAs<'static, Any, O, AnyArguments>
@@ -207,5 +225,41 @@ mod tests {
             numbered_placeholders("SELECT '?', \"?\", value FROM t WHERE a = ? AND b = ?"),
             "SELECT '?', \"?\", value FROM t WHERE a = $1 AND b = $2"
         );
+    }
+
+    #[test]
+    fn builds_multi_row_values_without_extra_parentheses() {
+        let mut builder = super::QueryBuilder::new("INSERT INTO logs (id, level) ");
+        builder.push_values([(1_i64, "INFO"), (2_i64, "DEBUG")], |row, (id, level)| {
+            row.push_bind(id).push_bind(level);
+        });
+
+        assert_eq!(
+            builder.sql(),
+            "INSERT INTO logs (id, level) VALUES ($1, $2), ($3, $4)"
+        );
+    }
+
+    #[test]
+    fn reads_sqlite_integer_booleans_through_any() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            sqlx::any::install_default_drivers();
+            let pool = sqlx::any::AnyPoolOptions::new()
+                .max_connections(1)
+                .connect("sqlite::memory:")
+                .await
+                .expect("open sqlite");
+            let row = super::query("SELECT 1 AS enabled, NULL AS inherited")
+                .fetch_one(&pool)
+                .await
+                .expect("query row");
+
+            assert!(super::bool_from_row(&row, "enabled").expect("read boolean"));
+            assert_eq!(
+                super::optional_bool_from_row(&row, "inherited").expect("read optional boolean"),
+                None
+            );
+        });
     }
 }

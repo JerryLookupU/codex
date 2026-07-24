@@ -450,7 +450,7 @@ impl ThreadRow {
             tokens_used: row.try_get("tokens_used")?,
             first_user_message: row.try_get("first_user_message")?,
             archived_at: row.try_get("archived_at")?,
-            is_pinned: row.try_get("is_pinned")?,
+            is_pinned: crate::db::bool_from_row(row, "is_pinned")?,
             git_sha: row.try_get("git_sha")?,
             git_branch: row.try_get("git_branch")?,
             git_origin_url: row.try_get("git_origin_url")?,

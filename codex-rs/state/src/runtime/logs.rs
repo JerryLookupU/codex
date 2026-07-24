@@ -516,9 +516,10 @@ fn push_log_filters(builder: &mut QueryBuilder, query: &LogQuery) {
         builder.push(" AND id > ").push_bind(after_id);
     }
     if let Some(search) = query.search.as_ref() {
-        builder.push(" AND POSITION(");
-        builder.push_bind(search.as_str());
-        builder.push(" IN COALESCE(feedback_log_body, '')) > 0");
+        builder
+            .push(" AND COALESCE(feedback_log_body, '') LIKE '%' || ")
+            .push_bind(search.as_str())
+            .push(" || '%'");
     }
 }
 

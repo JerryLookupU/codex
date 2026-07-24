@@ -30,6 +30,7 @@ pub(super) struct MigrationCounts {
     thread_turns: u64,
     thread_items: u64,
     thread_history_projection_state: u64,
+    thread_rollout_events: u64,
 }
 
 pub(super) async fn migrate_all(
@@ -454,13 +455,14 @@ pub(super) async fn migrate_all(
                     "turn_id",
                     "item_id",
                     "rollout_ordinal",
+                    "updated_at_ordinal",
                     "created_at_ms",
                     "item_json",
                     "item_type",
                 ],
                 conflict_columns: &["thread_id", "turn_id", "item_id"],
                 boolean_columns: &[],
-                integer_columns: &["rollout_ordinal", "created_at_ms"],
+                integer_columns: &["rollout_ordinal", "updated_at_ordinal", "created_at_ms"],
                 owner_column: Some("thread_id"),
             },
             &owned_thread_ids,
@@ -482,6 +484,37 @@ pub(super) async fn migrate_all(
                 conflict_columns: &["thread_id"],
                 boolean_columns: &[],
                 integer_columns: &["next_rollout_byte_offset", "next_rollout_ordinal"],
+                owner_column: Some("thread_id"),
+            },
+            &owned_thread_ids,
+            include_global,
+        )
+        .await?;
+        counts.thread_rollout_events = copy_simple_table(
+            postgres,
+            schema_name,
+            &sqlite,
+            TableCopy {
+                source: "thread_rollout_events",
+                destination: "thread_rollout_events",
+                columns: &[
+                    "thread_id",
+                    "rollout_ordinal",
+                    "rollout_byte_offset",
+                    "rollout_end_byte_offset",
+                    "created_at_ms",
+                    "line_type",
+                    "payload_type",
+                    "raw_json",
+                ],
+                conflict_columns: &["thread_id", "rollout_ordinal"],
+                boolean_columns: &[],
+                integer_columns: &[
+                    "rollout_ordinal",
+                    "rollout_byte_offset",
+                    "rollout_end_byte_offset",
+                    "created_at_ms",
+                ],
                 owner_column: Some("thread_id"),
             },
             &owned_thread_ids,
@@ -528,6 +561,7 @@ pub(super) async fn verify_counts(
             "thread_history_projection_state",
             expected.thread_history_projection_state,
         ),
+        ("thread_rollout_events", expected.thread_rollout_events),
     ];
 
     for (table_name, expected_count) in checks {
@@ -682,8 +716,17 @@ async fn copy_simple_table(
 
     let destination = schema::table(schema_name, table.destination);
     let all_columns = table.columns.to_vec();
-    let parameters = (1..=all_columns.len())
-        .map(|index| format!("${index}"))
+    let parameters = all_columns
+        .iter()
+        .enumerate()
+        .map(|(index, column)| {
+            let parameter = format!("${}", index + 1);
+            if table.destination == "thread_rollout_events" && *column == "raw_json" {
+                format!("CAST({parameter} AS JSONB)")
+            } else {
+                parameter
+            }
+        })
         .collect::<Vec<_>>()
         .join(", ");
     let conflict_columns = table.conflict_columns.to_vec();
@@ -760,10 +803,13 @@ async fn select_columns(
             if existing.iter().any(|item| item == column) {
                 format!("\"{column}\"")
             } else {
-                if table == "threads" && *column == "is_pinned" {
-                    "0 AS \"is_pinned\"".to_string()
-                } else {
-                    format!("NULL AS \"{column}\"")
+                match (table, *column) {
+                    ("threads", "is_pinned") => "0 AS \"is_pinned\"".to_string(),
+                    ("thread_items", "updated_at_ordinal") => {
+                        "\"rollout_ordinal\" AS \"updated_at_ordinal\"".to_string()
+                    }
+                    ("thread_items", "item_type") => "'' AS \"item_type\"".to_string(),
+                    _ => format!("NULL AS \"{column}\""),
                 }
             }
         })
@@ -786,4 +832,53 @@ fn quoted(columns: &[&str]) -> String {
         .map(|column| format!("\"{column}\""))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::select_columns;
+    use sqlx::SqlitePool;
+
+    #[tokio::test]
+    async fn legacy_thread_item_columns_receive_non_null_defaults() {
+        let sqlite = SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("open SQLite");
+        sqlx::query(
+            "CREATE TABLE thread_items (
+                thread_id TEXT,
+                turn_id TEXT,
+                item_id TEXT,
+                rollout_ordinal INTEGER,
+                created_at_ms INTEGER,
+                item_json TEXT
+            )",
+        )
+        .execute(&sqlite)
+        .await
+        .expect("create legacy thread_items");
+
+        let columns = select_columns(
+            &sqlite,
+            "thread_items",
+            &[
+                "thread_id",
+                "rollout_ordinal",
+                "updated_at_ordinal",
+                "item_type",
+            ],
+        )
+        .await
+        .expect("select compatibility columns");
+
+        assert_eq!(
+            columns,
+            [
+                "\"thread_id\"",
+                "\"rollout_ordinal\"",
+                "\"rollout_ordinal\" AS \"updated_at_ordinal\"",
+                "'' AS \"item_type\"",
+            ]
+        );
+    }
 }

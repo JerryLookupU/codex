@@ -291,9 +291,9 @@ WHERE thread_id = ?
         .fetch_optional(&mut *tx)
         .await?;
         let was_selected_for_phase2 = existing_output
-            .map(|row| row.try_get::<i64, _>("selected_for_phase2"))
+            .map(|row| crate::db::bool_from_row(&row, "selected_for_phase2"))
             .transpose()?
-            .is_some_and(|selected| selected != 0);
+            .unwrap_or(false);
 
         let deleted_rows = crate::db::query(
             r#"
@@ -395,7 +395,7 @@ DELETE FROM stage1_outputs
 WHERE thread_id IN (
     SELECT thread_id
     FROM stage1_outputs
-    WHERE selected_for_phase2 = 0
+    WHERE selected_for_phase2 = FALSE
       AND COALESCE(last_usage, source_updated_at) < ?
     ORDER BY
       COALESCE(last_usage, source_updated_at) ASC,
@@ -595,7 +595,7 @@ WHERE threads.id = ? AND threads.memory_mode = 'enabled'
     ) -> anyhow::Result<bool> {
         let now = Utc::now().timestamp();
         let thread_id = thread_id.to_string();
-        let selected_for_phase2 = sqlx::query_scalar::<_, i64>(
+        let selected_for_phase2 = crate::db::query(
             r#"
 SELECT selected_for_phase2
 FROM stage1_outputs
@@ -605,7 +605,9 @@ WHERE thread_id = ?
         .bind(thread_id.as_str())
         .fetch_optional(self.pool.as_ref())
         .await?
-        .unwrap_or(0);
+        .map(|row| crate::db::bool_from_row(&row, "selected_for_phase2"))
+        .transpose()?
+        .unwrap_or(false);
         let rows_affected = crate::db::query(
             r#"
 UPDATE threads
@@ -618,7 +620,7 @@ WHERE id = ? AND memory_mode != 'polluted'
         .await?
         .rows_affected();
 
-        if selected_for_phase2 != 0 {
+        if selected_for_phase2 {
             self.enqueue_global_consolidation(now).await?;
         }
 
@@ -1239,9 +1241,9 @@ WHERE kind = ? AND job_key = ?
             r#"
 UPDATE stage1_outputs
 SET
-    selected_for_phase2 = 0,
+    selected_for_phase2 = FALSE,
     selected_for_phase2_source_updated_at = NULL
-WHERE selected_for_phase2 != 0 OR selected_for_phase2_source_updated_at IS NOT NULL
+WHERE selected_for_phase2 = TRUE OR selected_for_phase2_source_updated_at IS NOT NULL
             "#,
         )
         .execute(&mut *tx)
@@ -1252,7 +1254,7 @@ WHERE selected_for_phase2 != 0 OR selected_for_phase2_source_updated_at IS NOT N
                 r#"
 UPDATE stage1_outputs
 SET
-    selected_for_phase2 = 1,
+    selected_for_phase2 = TRUE,
     selected_for_phase2_source_updated_at = ?
 WHERE thread_id = ? AND source_updated_at = ?
                 "#,
@@ -1291,7 +1293,7 @@ SET
     finished_at = ?,
     lease_until = NULL,
     retry_at = ?,
-    retry_remaining = GREATEST(retry_remaining - 1, 0),
+    retry_remaining = CASE WHEN retry_remaining > 0 THEN retry_remaining - 1 ELSE 0 END,
     last_error = ?
 WHERE kind = ? AND job_key = ?
   AND status = 'running' AND ownership_token = ?
@@ -1332,7 +1334,7 @@ SET
     finished_at = ?,
     lease_until = NULL,
     retry_at = ?,
-    retry_remaining = GREATEST(retry_remaining - 1, 0),
+    retry_remaining = CASE WHEN retry_remaining > 0 THEN retry_remaining - 1 ELSE 0 END,
     last_error = ?
 WHERE kind = ? AND job_key = ?
   AND status = 'running'
@@ -1370,12 +1372,16 @@ SET
     finished_at = ?,
     lease_until = NULL,
     last_error = NULL,
-    last_success_watermark = GREATEST(COALESCE(last_success_watermark, 0), ?)
+    last_success_watermark = CASE
+        WHEN COALESCE(last_success_watermark, 0) > ? THEN COALESCE(last_success_watermark, 0)
+        ELSE ?
+    END
 WHERE kind = ? AND job_key = ?
   AND status = 'running' AND ownership_token = ?
             "#,
     )
     .bind(now)
+    .bind(completed_watermark)
     .bind(completed_watermark)
     .bind(JOB_KIND_MEMORY_CONSOLIDATE_GLOBAL)
     .bind(MEMORY_CONSOLIDATION_JOB_KEY)
@@ -1472,7 +1478,11 @@ ON CONFLICT(kind, job_key) DO UPDATE SET
         WHEN jobs.status = 'running' THEN jobs.retry_at
         ELSE NULL
     END,
-    retry_remaining = GREATEST(jobs.retry_remaining, excluded.retry_remaining),
+    retry_remaining = CASE
+        WHEN jobs.retry_remaining > excluded.retry_remaining
+            THEN jobs.retry_remaining
+        ELSE excluded.retry_remaining
+    END,
     input_watermark = CASE
         WHEN excluded.input_watermark > COALESCE(jobs.input_watermark, 0)
             THEN excluded.input_watermark
@@ -1941,25 +1951,38 @@ mod tests {
         let runtime_a = Arc::clone(&runtime);
         let runtime_b = Arc::clone(&runtime);
 
+        async fn claim_with_lock_retry(
+            runtime: Arc<StateRuntime>,
+            thread_id: ThreadId,
+            owner: ThreadId,
+            source_updated_at: i64,
+        ) -> Stage1JobClaimOutcome {
+            for attempt in 0..5 {
+                match runtime
+                    .try_claim_stage1_job(
+                        thread_id,
+                        owner,
+                        source_updated_at,
+                        /*lease_seconds*/ 3_600,
+                        /*max_running_jobs*/ 1,
+                    )
+                    .await
+                {
+                    Ok(outcome) => return outcome,
+                    Err(error)
+                        if error.to_string().contains("database is locked") && attempt < 4 =>
+                    {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                    Err(error) => panic!("claim stage1 should not fail: {error}"),
+                }
+            }
+            panic!("claim stage1 should have returned within retry budget")
+        }
+
         let (claim_a, claim_b) = tokio::join!(
-            async move {
-                runtime_a
-                    .try_claim_stage1_job(
-                        thread_a, owner_a, /*source_updated_at*/ 100,
-                        /*lease_seconds*/ 3_600, /*max_running_jobs*/ 1,
-                    )
-                    .await
-                    .expect("claim stage1 thread a")
-            },
-            async move {
-                runtime_b
-                    .try_claim_stage1_job(
-                        thread_b, owner_b, /*source_updated_at*/ 101,
-                        /*lease_seconds*/ 3_600, /*max_running_jobs*/ 1,
-                    )
-                    .await
-                    .expect("claim stage1 thread b")
-            },
+            claim_with_lock_retry(runtime_a, thread_a, owner_a, 100),
+            claim_with_lock_retry(runtime_b, thread_b, owner_b, 101),
         );
 
         let claim_outcomes = vec![claim_a, claim_b];

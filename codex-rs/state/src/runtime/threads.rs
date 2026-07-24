@@ -340,10 +340,10 @@ ON CONFLICT(child_thread_id) DO NOTHING
         builder.push_bind(id.to_string());
         match archived_only {
             Some(true) => {
-                builder.push(" AND archived = 1");
+                builder.push(" AND archived = TRUE");
             }
             Some(false) => {
-                builder.push(" AND archived = 0");
+                builder.push(" AND archived = FALSE");
             }
             None => {}
         }
@@ -1269,9 +1269,9 @@ pub(super) fn push_thread_filters<'a>(
     } = options;
     builder.push(" WHERE 1 = 1");
     if archived_only {
-        builder.push(" AND threads.archived = 1");
+        builder.push(" AND threads.archived = TRUE");
     } else {
-        builder.push(" AND threads.archived = 0");
+        builder.push(" AND threads.archived = FALSE");
     }
     builder.push(" AND threads.preview <> ''");
     if let Some(is_pinned) = is_pinned {

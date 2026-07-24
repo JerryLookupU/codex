@@ -281,6 +281,8 @@ CREATE TABLE IF NOT EXISTS "{{schema}}".thread_items (
     item_type TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (thread_id, turn_id, item_id)
 );
+ALTER TABLE "{{schema}}".thread_items
+    ADD COLUMN IF NOT EXISTS updated_at_ordinal BIGINT NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS idx_thread_items_by_turn_page
     ON "{{schema}}".thread_items(thread_id, turn_id, rollout_ordinal);
 CREATE INDEX IF NOT EXISTS idx_thread_items_by_update

@@ -58,7 +58,10 @@ WHERE websocket_url = ? AND account_id = ? AND app_server_client_name = ?
                 server_id: row.try_get("server_id")?,
                 environment_id: row.try_get("environment_id")?,
                 server_name: row.try_get("server_name")?,
-                remote_control_enabled: row.try_get("remote_control_enabled")?,
+                remote_control_enabled: crate::db::optional_bool_from_row(
+                    &row,
+                    "remote_control_enabled",
+                )?,
             })
         })
         .transpose()
