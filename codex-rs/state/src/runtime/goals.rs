@@ -4,11 +4,11 @@ use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct GoalStore {
-    pool: Arc<SqlitePool>,
+    pool: Arc<Pool>,
 }
 
 impl GoalStore {
-    pub(crate) fn new(pool: Arc<SqlitePool>) -> Self {
+    pub(crate) fn new(pool: Arc<Pool>) -> Self {
         Self { pool }
     }
 
@@ -42,7 +42,7 @@ impl GoalStore {
         &self,
         thread_id: ThreadId,
     ) -> anyhow::Result<Option<crate::ThreadGoal>> {
-        let row = sqlx::query(
+        let row = crate::db::query(
             r#"
 SELECT
     thread_id,
@@ -70,7 +70,7 @@ WHERE thread_id = ?
         goal: &crate::ThreadGoal,
     ) -> anyhow::Result<()> {
         let mut transaction = self.pool.begin().await?;
-        sqlx::query(
+        crate::db::query(
             r#"
 INSERT INTO thread_goals (
     thread_id,
@@ -106,7 +106,7 @@ ON CONFLICT(thread_id) DO UPDATE SET
         .execute(&mut *transaction)
         .await?;
 
-        sqlx::query(
+        crate::db::query(
             r#"
 INSERT INTO thread_goal_continuation_deferrals (thread_id)
 VALUES (?)
@@ -126,7 +126,7 @@ ON CONFLICT(thread_id) DO NOTHING
         &self,
         thread_id: ThreadId,
     ) -> anyhow::Result<bool> {
-        sqlx::query_scalar(
+        crate::db::query_scalar(
             r#"
 SELECT EXISTS(
     SELECT 1
@@ -145,7 +145,7 @@ SELECT EXISTS(
         &self,
         thread_id: ThreadId,
     ) -> anyhow::Result<()> {
-        sqlx::query("DELETE FROM thread_goal_continuation_deferrals WHERE thread_id = ?")
+        crate::db::query("DELETE FROM thread_goal_continuation_deferrals WHERE thread_id = ?")
             .bind(thread_id.to_string())
             .execute(self.pool.as_ref())
             .await?;
@@ -163,7 +163,7 @@ SELECT EXISTS(
         let goal_id = Uuid::new_v4().to_string();
         let now_ms = datetime_to_epoch_millis(Utc::now());
         let status = status_after_budget_limit(status, /*tokens_used*/ 0, token_budget);
-        let row = sqlx::query(
+        let row = crate::db::query(
             r#"
 INSERT INTO thread_goals (
     thread_id,
@@ -220,7 +220,7 @@ RETURNING
         let goal_id = Uuid::new_v4().to_string();
         let now_ms = datetime_to_epoch_millis(Utc::now());
         let status = status_after_budget_limit(status, /*tokens_used*/ 0, token_budget);
-        let row = sqlx::query(
+        let row = crate::db::query(
             r#"
 INSERT INTO thread_goals (
     thread_id,
@@ -284,7 +284,7 @@ RETURNING
         let now_ms = datetime_to_epoch_millis(Utc::now());
         let result = match (status, token_budget) {
             (Some(status), Some(token_budget)) => {
-                sqlx::query(
+                crate::db::query(
                     r#"
 UPDATE thread_goals
 SET
@@ -319,7 +319,7 @@ WHERE thread_id = ?
                 .await?
             }
             (Some(status), None) => {
-                sqlx::query(
+                crate::db::query(
                     r#"
 UPDATE thread_goals
 SET
@@ -350,7 +350,7 @@ WHERE thread_id = ?
                 .await?
             }
             (None, Some(token_budget)) => {
-                sqlx::query(
+                crate::db::query(
                     r#"
 UPDATE thread_goals
 SET
@@ -379,7 +379,7 @@ WHERE thread_id = ?
             }
             (None, None) => {
                 if let Some(objective) = objective {
-                    sqlx::query(
+                    crate::db::query(
                         r#"
 UPDATE thread_goals
 SET
@@ -439,7 +439,7 @@ WHERE thread_id = ?
         status: crate::ThreadGoalStatus,
     ) -> anyhow::Result<Option<crate::ThreadGoal>> {
         let now_ms = datetime_to_epoch_millis(Utc::now());
-        let result = sqlx::query(
+        let result = crate::db::query(
             r#"
 UPDATE thread_goals
 SET
@@ -473,7 +473,7 @@ WHERE thread_id = ?
         &self,
         thread_id: ThreadId,
     ) -> anyhow::Result<Option<crate::ThreadGoal>> {
-        let row = sqlx::query(
+        let row = crate::db::query(
             r#"
 DELETE FROM thread_goals
 WHERE thread_id = ?
@@ -529,7 +529,7 @@ RETURNING
             | GoalAccountingMode::ActiveOrComplete => "status = 'active'",
             GoalAccountingMode::ActiveOrStopped => active_or_stopped_status_filter,
         };
-        let mut builder = QueryBuilder::<Sqlite>::new(
+        let mut builder = QueryBuilder::new(
             r#"
 UPDATE thread_goals
 SET
@@ -611,7 +611,7 @@ RETURNING
     }
 }
 
-fn thread_goal_from_row(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<crate::ThreadGoal> {
+fn thread_goal_from_row(row: &crate::db::Row) -> anyhow::Result<crate::ThreadGoal> {
     ThreadGoalRow::try_from_row(row).and_then(crate::ThreadGoal::try_from)
 }
 

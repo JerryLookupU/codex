@@ -76,7 +76,7 @@ pub(in crate::local) async fn search_thread_occurrences(
         .map_or(0, |cursor| cursor.next_rollout_ordinal);
     let matcher = LiteralMatcher::new(params.search_term.as_str());
     let pool = store.thread_history_db().await?;
-    let mut rows = sqlx::query(
+    let mut rows = codex_state::db::query(
         r#"
 SELECT turn_id, item_id, rollout_ordinal, item_json, turn_rollout_ordinal
 FROM (
@@ -184,7 +184,7 @@ ORDER BY rollout_ordinal ASC
     })
 }
 
-fn candidate_row(row: sqlx::sqlite::SqliteRow) -> ThreadStoreResult<CandidateRow> {
+fn candidate_row(row: codex_state::db::Row) -> ThreadStoreResult<CandidateRow> {
     let rollout_ordinal = row.try_get::<i64, _>("rollout_ordinal")?;
     let turn_rollout_ordinal = row.try_get::<i64, _>("turn_rollout_ordinal")?;
     if rollout_ordinal < 0 || turn_rollout_ordinal < 0 {

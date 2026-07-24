@@ -167,10 +167,10 @@ pub(super) async fn validate_thread_for_paginated_reads(
 }
 
 async fn load_summary_items(
-    pool: &sqlx::SqlitePool,
+    pool: &codex_state::db::Pool,
     turn: &StoredTurnRow,
 ) -> ThreadStoreResult<Vec<StoredThreadItem>> {
-    let rows = sqlx::query(
+    let rows = codex_state::db::query(
         r#"
 SELECT turn_id, item_id, updated_at_ordinal, created_at_ms, item_json
 FROM thread_items
@@ -226,7 +226,7 @@ pub(super) fn serialize_cursor(
 
 pub(super) fn stored_turn_row(
     physical_thread_id: ThreadId,
-    row: sqlx::sqlite::SqliteRow,
+    row: codex_state::db::Row,
 ) -> ThreadStoreResult<StoredTurnRow> {
     let status = match row.try_get::<String, _>("status")?.as_str() {
         "completed" => StoredTurnStatus::Completed,
@@ -263,7 +263,7 @@ pub(super) fn stored_turn_row(
 
 pub(super) fn stored_thread_item_row_for_thread(
     physical_thread_id: ThreadId,
-    row: sqlx::sqlite::SqliteRow,
+    row: codex_state::db::Row,
 ) -> ThreadStoreResult<StoredThreadItemRow> {
     let rollout_ordinal = row.try_get::<i64, _>("rollout_ordinal")?;
     if rollout_ordinal < 0 {
@@ -280,7 +280,7 @@ pub(super) fn stored_thread_item_row_for_thread(
     })
 }
 
-fn stored_thread_item(row: sqlx::sqlite::SqliteRow) -> ThreadStoreResult<StoredThreadItem> {
+fn stored_thread_item(row: codex_state::db::Row) -> ThreadStoreResult<StoredThreadItem> {
     let updated_at_ordinal = row.try_get::<i64, _>("updated_at_ordinal")?;
     let updated_at_ordinal =
         u64::try_from(updated_at_ordinal).map_err(|_| ThreadStoreError::Internal {

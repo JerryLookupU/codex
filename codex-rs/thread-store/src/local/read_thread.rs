@@ -34,6 +34,24 @@ pub(super) async fn read_thread(
     params: ReadThreadParams,
 ) -> ThreadStoreResult<StoredThread> {
     let thread_id = params.thread_id;
+    if store.postgres_canonical() {
+        let metadata = read_sqlite_metadata(store, thread_id)
+            .await
+            .ok_or(ThreadStoreError::ThreadNotFound { thread_id })?;
+        if !params.include_archived && metadata.archived_at.is_some() {
+            return Err(ThreadStoreError::InvalidRequest {
+                message: format!("thread {thread_id} is archived"),
+            });
+        }
+        let mut thread = stored_thread_from_sqlite_metadata(store, metadata).await?;
+        if params.include_history {
+            thread.history = Some(StoredThreadHistory {
+                thread_id,
+                items: super::thread_history::load_rollout_items(store, thread_id).await?,
+            });
+        }
+        return Ok(thread);
+    }
     if let Some(metadata) = read_sqlite_metadata(store, thread_id).await
         && (params.include_archived
             || (metadata.archived_at.is_none()
@@ -333,32 +351,41 @@ async fn stored_thread_from_sqlite_metadata(
     store: &LocalThreadStore,
     metadata: ThreadMetadata,
 ) -> ThreadStoreResult<StoredThread> {
-    let session_meta = match read_required_session_meta_line(metadata.rollout_path.as_path()).await
-    {
-        Ok(meta_line) => Some(meta_line.meta),
-        Err(_)
-            if codex_rollout::existing_rollout_path(metadata.rollout_path.as_path())
-                .await
-                .is_none() =>
-        {
-            None
-        }
-        Err(err) => {
-            return Err(ThreadStoreError::Internal {
-                message: format!(
-                    "failed to read session metadata {}: {err}",
-                    metadata.rollout_path.display()
-                ),
-            });
+    let session_meta = if store.postgres_canonical() {
+        super::thread_history::load_session_meta(store, metadata.id)
+            .await?
+            .map(|line| line.meta)
+    } else {
+        match read_required_session_meta_line(metadata.rollout_path.as_path()).await {
+            Ok(meta_line) => Some(meta_line.meta),
+            Err(_)
+                if codex_rollout::existing_rollout_path(metadata.rollout_path.as_path())
+                    .await
+                    .is_none() =>
+            {
+                None
+            }
+            Err(err) => {
+                return Err(ThreadStoreError::Internal {
+                    message: format!(
+                        "failed to read session metadata {}: {err}",
+                        metadata.rollout_path.display()
+                    ),
+                });
+            }
         }
     };
     let rollout_path = codex_rollout::plain_rollout_path(metadata.rollout_path.as_path());
     let forked_from_id = session_meta.as_ref().and_then(|meta| meta.forked_from_id);
     let parent_thread_id = session_meta.as_ref().and_then(|meta| meta.parent_thread_id);
-    let history_mode = session_meta
-        .as_ref()
-        .map(|meta| meta.history_mode)
-        .unwrap_or(metadata.history_mode);
+    let history_mode = if store.postgres_canonical() {
+        metadata.history_mode
+    } else {
+        session_meta
+            .as_ref()
+            .map(|meta| meta.history_mode)
+            .unwrap_or(metadata.history_mode)
+    };
     let name = thread_name_from_metadata(store, &metadata, history_mode).await;
     let preview = metadata
         .preview

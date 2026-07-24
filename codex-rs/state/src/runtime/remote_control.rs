@@ -33,7 +33,7 @@ impl StateRuntime {
         account_id: &str,
         app_server_client_name: Option<&str>,
     ) -> anyhow::Result<Option<RemoteControlEnrollmentRecord>> {
-        let row = sqlx::query(
+        let row = crate::db::query(
             r#"
 SELECT websocket_url, account_id, app_server_client_name, server_id, environment_id, server_name,
     remote_control_enabled
@@ -68,7 +68,7 @@ WHERE websocket_url = ? AND account_id = ? AND app_server_client_name = ?
         &self,
         enrollment: &RemoteControlEnrollmentRecord,
     ) -> anyhow::Result<()> {
-        sqlx::query(
+        crate::db::query(
             r#"
 INSERT INTO remote_control_enrollments (
     websocket_url,
@@ -109,7 +109,7 @@ ON CONFLICT(websocket_url, account_id, app_server_client_name) DO UPDATE SET
         app_server_client_name: Option<&str>,
         remote_control_enabled: bool,
     ) -> anyhow::Result<u64> {
-        let result = sqlx::query(
+        let result = crate::db::query(
             r#"
 UPDATE remote_control_enrollments
 SET remote_control_enabled = ?, updated_at = ?
@@ -134,7 +134,7 @@ WHERE websocket_url = ? AND account_id = ? AND app_server_client_name = ?
         account_id: &str,
         app_server_client_name: Option<&str>,
     ) -> anyhow::Result<u64> {
-        let result = sqlx::query(
+        let result = crate::db::query(
             r#"
 DELETE FROM remote_control_enrollments
 WHERE websocket_url = ? AND account_id = ? AND app_server_client_name = ?

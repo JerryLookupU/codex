@@ -2,6 +2,7 @@ use super::threads::ThreadFilterOptions;
 use super::threads::push_thread_filters;
 use super::*;
 use crate::SortDirection;
+use crate::db::QueryBuilder;
 use crate::model::Phase2JobClaimOutcome;
 use crate::model::Stage1JobClaim;
 use crate::model::Stage1JobClaimOutcome;
@@ -11,8 +12,7 @@ use crate::model::ThreadRow;
 use chrono::DateTime;
 use chrono::Duration;
 use sqlx::Executor;
-use sqlx::QueryBuilder;
-use sqlx::Sqlite;
+
 use uuid::Uuid;
 
 const JOB_KIND_MEMORY_STAGE1: &str = "memory_stage1";
@@ -26,12 +26,12 @@ const DEFAULT_RETRY_REMAINING: i64 = 3;
 /// Store for generated memory state and memory extraction/consolidation jobs.
 #[derive(Clone)]
 pub struct MemoryStore {
-    pool: Arc<SqlitePool>,
-    state_pool: Arc<SqlitePool>,
+    pool: Arc<Pool>,
+    state_pool: Arc<Pool>,
 }
 
 impl MemoryStore {
-    pub(crate) fn new(pool: Arc<SqlitePool>, state_pool: Arc<SqlitePool>) -> Self {
+    pub(crate) fn new(pool: Arc<Pool>, state_pool: Arc<Pool>) -> Self {
         Self { pool, state_pool }
     }
 
@@ -65,7 +65,7 @@ impl MemoryStore {
         let mut updated_rows = 0;
 
         for thread_id in thread_ids {
-            updated_rows += sqlx::query(
+            updated_rows += crate::db::query(
                 r#"
 UPDATE stage1_outputs
 SET
@@ -91,7 +91,7 @@ WHERE thread_id = ?
         source_updated_at: i64,
     ) -> anyhow::Result<bool> {
         let thread_id = thread_id.to_string();
-        let existing_output = sqlx::query(
+        let existing_output = crate::db::query(
             r#"
 SELECT source_updated_at
 FROM stage1_outputs
@@ -108,7 +108,7 @@ WHERE thread_id = ?
             }
         }
 
-        let existing_job = sqlx::query(
+        let existing_job = crate::db::query(
             r#"
 SELECT last_success_watermark
 FROM jobs
@@ -168,7 +168,7 @@ WHERE kind = ? AND job_key = ?
         let idle_cutoff =
             (Utc::now() - Duration::hours(min_rollout_idle_hours.max(0))).timestamp_millis();
 
-        let mut builder = QueryBuilder::<Sqlite>::new(
+        let mut builder = QueryBuilder::new(
             r#"
 SELECT
     threads.id,
@@ -280,7 +280,7 @@ FROM threads
         let thread_id = thread_id.to_string();
         let mut tx = self.pool.begin().await?;
 
-        let existing_output = sqlx::query(
+        let existing_output = crate::db::query(
             r#"
 SELECT selected_for_phase2
 FROM stage1_outputs
@@ -295,7 +295,7 @@ WHERE thread_id = ?
             .transpose()?
             .is_some_and(|selected| selected != 0);
 
-        let deleted_rows = sqlx::query(
+        let deleted_rows = crate::db::query(
             r#"
 DELETE FROM stage1_outputs
 WHERE thread_id = ?
@@ -306,7 +306,7 @@ WHERE thread_id = ?
         .await?
         .rows_affected();
 
-        sqlx::query(
+        crate::db::query(
             r#"
 DELETE FROM jobs
 WHERE kind = ? AND job_key = ?
@@ -341,7 +341,7 @@ WHERE kind = ? AND job_key = ?
             return Ok(Vec::new());
         }
 
-        let rows = sqlx::query(
+        let rows = crate::db::query(
             r#"
 SELECT
     so.thread_id,
@@ -389,7 +389,7 @@ ORDER BY so.source_updated_at DESC, so.thread_id DESC
         }
 
         let cutoff = (Utc::now() - Duration::days(max_unused_days.max(0))).timestamp();
-        let rows_affected = sqlx::query(
+        let rows_affected = crate::db::query(
             r#"
 DELETE FROM stage1_outputs
 WHERE thread_id IN (
@@ -445,7 +445,7 @@ WHERE thread_id IN (
         let mut selected_keys = Vec::with_capacity(n);
 
         while selected_keys.len() < n {
-            let candidate_rows = sqlx::query(
+            let candidate_rows = crate::db::query(
                 r#"
 SELECT
     so.thread_id,
@@ -496,7 +496,7 @@ LIMIT ? OFFSET ?
 
         let mut selected = Vec::with_capacity(selected_keys.len());
         for (thread_id, source_updated_at) in selected_keys {
-            let Some(row) = sqlx::query(
+            let Some(row) = crate::db::query(
                 r#"
 SELECT
     so.thread_id,
@@ -528,7 +528,7 @@ WHERE so.thread_id = ? AND so.source_updated_at = ?
 
     async fn stage1_output_from_row_if_thread_enabled(
         &self,
-        row: &sqlx::sqlite::SqliteRow,
+        row: &crate::db::Row,
     ) -> anyhow::Result<Option<Stage1Output>> {
         let thread_id: String = row.try_get("thread_id")?;
         let Some(thread) = self
@@ -544,7 +544,7 @@ WHERE so.thread_id = ? AND so.source_updated_at = ?
         &self,
         thread_id: ThreadId,
     ) -> anyhow::Result<Option<ThreadMetadata>> {
-        let row = sqlx::query(
+        let row = crate::db::query(
             r#"
 SELECT
     threads.id,
@@ -606,7 +606,7 @@ WHERE thread_id = ?
         .fetch_optional(self.pool.as_ref())
         .await?
         .unwrap_or(0);
-        let rows_affected = sqlx::query(
+        let rows_affected = crate::db::query(
             r#"
 UPDATE threads
 SET memory_mode = 'polluted'
@@ -656,9 +656,9 @@ WHERE id = ? AND memory_mode != 'polluted'
         let thread_id = thread_id.to_string();
         let worker_id = worker_id.to_string();
 
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = self.pool.begin().await?;
 
-        let existing_output = sqlx::query(
+        let existing_output = crate::db::query(
             r#"
 SELECT source_updated_at
 FROM stage1_outputs
@@ -675,7 +675,7 @@ WHERE thread_id = ?
                 return Ok(Stage1JobClaimOutcome::SkippedUpToDate);
             }
         }
-        let existing_job = sqlx::query(
+        let existing_job = crate::db::query(
             r#"
 SELECT last_success_watermark
 FROM jobs
@@ -695,7 +695,7 @@ WHERE kind = ? AND job_key = ?
             }
         }
 
-        let rows_affected = sqlx::query(
+        let rows_affected = crate::db::query(
             r#"
 INSERT INTO jobs (
     kind,
@@ -779,7 +779,7 @@ WHERE
             return Ok(Stage1JobClaimOutcome::Claimed { ownership_token });
         }
 
-        let existing_job = sqlx::query(
+        let existing_job = crate::db::query(
             r#"
 SELECT status, lease_until, retry_at, retry_remaining
 FROM jobs
@@ -841,7 +841,7 @@ WHERE kind = ? AND job_key = ?
         let thread_id = thread_id.to_string();
 
         let mut tx = self.pool.begin().await?;
-        let rows_affected = sqlx::query(
+        let rows_affected = crate::db::query(
             r#"
 UPDATE jobs
 SET
@@ -867,7 +867,7 @@ WHERE kind = ? AND job_key = ?
             return Ok(false);
         }
 
-        sqlx::query(
+        crate::db::query(
             r#"
 INSERT INTO stage1_outputs (
     thread_id,
@@ -918,7 +918,7 @@ WHERE excluded.source_updated_at >= stage1_outputs.source_updated_at
         let thread_id = thread_id.to_string();
 
         let mut tx = self.pool.begin().await?;
-        let rows_affected = sqlx::query(
+        let rows_affected = crate::db::query(
             r#"
 UPDATE jobs
 SET
@@ -944,7 +944,7 @@ WHERE kind = ? AND job_key = ?
             return Ok(false);
         }
 
-        let source_updated_at = sqlx::query(
+        let source_updated_at = crate::db::query(
             r#"
 SELECT input_watermark
 FROM jobs
@@ -958,7 +958,7 @@ WHERE kind = ? AND job_key = ? AND ownership_token = ?
         .await?
         .try_get::<i64, _>("input_watermark")?;
 
-        let deleted_rows = sqlx::query(
+        let deleted_rows = crate::db::query(
             r#"
 DELETE FROM stage1_outputs
 WHERE thread_id = ?
@@ -995,7 +995,7 @@ WHERE thread_id = ?
         let retry_at = now.saturating_add(retry_delay_seconds.max(0));
         let thread_id = thread_id.to_string();
 
-        let rows_affected = sqlx::query(
+        let rows_affected = crate::db::query(
             r#"
 UPDATE jobs
 SET
@@ -1057,9 +1057,9 @@ WHERE kind = ? AND job_key = ?
         let ownership_token = Uuid::new_v4().to_string();
         let worker_id = worker_id.to_string();
 
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = self.pool.begin().await?;
 
-        let existing_job = sqlx::query(
+        let existing_job = crate::db::query(
             r#"
 SELECT status, lease_until, retry_at, input_watermark, finished_at, last_error
 FROM jobs
@@ -1072,7 +1072,7 @@ WHERE kind = ? AND job_key = ?
         .await?;
 
         let Some(existing_job) = existing_job else {
-            let rows_affected = sqlx::query(
+            let rows_affected = crate::db::query(
                 r#"
 INSERT INTO jobs (
     kind,
@@ -1136,7 +1136,7 @@ INSERT INTO jobs (
             return Ok(Phase2JobClaimOutcome::SkippedCooldown);
         }
 
-        let rows_affected = sqlx::query(
+        let rows_affected = crate::db::query(
             r#"
 UPDATE jobs
 SET
@@ -1190,7 +1190,7 @@ WHERE kind = ? AND job_key = ?
     ) -> anyhow::Result<bool> {
         let now = Utc::now().timestamp();
         let lease_until = now.saturating_add(lease_seconds.max(0));
-        let rows_affected = sqlx::query(
+        let rows_affected = crate::db::query(
             r#"
 UPDATE jobs
 SET lease_until = ?
@@ -1235,7 +1235,7 @@ WHERE kind = ? AND job_key = ?
             return Ok(false);
         }
 
-        sqlx::query(
+        crate::db::query(
             r#"
 UPDATE stage1_outputs
 SET
@@ -1248,7 +1248,7 @@ WHERE selected_for_phase2 != 0 OR selected_for_phase2_source_updated_at IS NOT N
         .await?;
 
         for output in selected_outputs {
-            sqlx::query(
+            crate::db::query(
                 r#"
 UPDATE stage1_outputs
 SET
@@ -1283,7 +1283,7 @@ WHERE thread_id = ? AND source_updated_at = ?
     ) -> anyhow::Result<bool> {
         let now = Utc::now().timestamp();
         let retry_at = now.saturating_add(retry_delay_seconds.max(0));
-        let rows_affected = sqlx::query(
+        let rows_affected = crate::db::query(
             r#"
 UPDATE jobs
 SET
@@ -1291,7 +1291,7 @@ SET
     finished_at = ?,
     lease_until = NULL,
     retry_at = ?,
-    retry_remaining = max(retry_remaining - 1, 0),
+    retry_remaining = GREATEST(retry_remaining - 1, 0),
     last_error = ?
 WHERE kind = ? AND job_key = ?
   AND status = 'running' AND ownership_token = ?
@@ -1324,7 +1324,7 @@ WHERE kind = ? AND job_key = ?
     ) -> anyhow::Result<bool> {
         let now = Utc::now().timestamp();
         let retry_at = now.saturating_add(retry_delay_seconds.max(0));
-        let rows_affected = sqlx::query(
+        let rows_affected = crate::db::query(
             r#"
 UPDATE jobs
 SET
@@ -1332,7 +1332,7 @@ SET
     finished_at = ?,
     lease_until = NULL,
     retry_at = ?,
-    retry_remaining = max(retry_remaining - 1, 0),
+    retry_remaining = GREATEST(retry_remaining - 1, 0),
     last_error = ?
 WHERE kind = ? AND job_key = ?
   AND status = 'running'
@@ -1359,10 +1359,10 @@ async fn mark_global_phase2_job_succeeded_row<'e, E>(
     completed_watermark: i64,
 ) -> anyhow::Result<u64>
 where
-    E: Executor<'e, Database = Sqlite>,
+    E: Executor<'e, Database = sqlx::Any>,
 {
     let now = Utc::now().timestamp();
-    let rows_affected = sqlx::query(
+    let rows_affected = crate::db::query(
         r#"
 UPDATE jobs
 SET
@@ -1370,7 +1370,7 @@ SET
     finished_at = ?,
     lease_until = NULL,
     last_error = NULL,
-    last_success_watermark = max(COALESCE(last_success_watermark, 0), ?)
+    last_success_watermark = GREATEST(COALESCE(last_success_watermark, 0), ?)
 WHERE kind = ? AND job_key = ?
   AND status = 'running' AND ownership_token = ?
             "#,
@@ -1387,10 +1387,10 @@ WHERE kind = ? AND job_key = ?
     Ok(rows_affected)
 }
 
-pub(super) async fn clear_memory_data_in_pool(pool: &SqlitePool) -> anyhow::Result<()> {
+pub(super) async fn clear_memory_data_in_pool(pool: &Pool) -> anyhow::Result<()> {
     let mut tx = pool.begin().await?;
 
-    sqlx::query(
+    crate::db::query(
         r#"
 DELETE FROM stage1_outputs
             "#,
@@ -1398,7 +1398,7 @@ DELETE FROM stage1_outputs
     .execute(&mut *tx)
     .await?;
 
-    sqlx::query(
+    crate::db::query(
         r#"
 DELETE FROM jobs
 WHERE kind = ? OR kind = ?
@@ -1414,7 +1414,7 @@ WHERE kind = ? OR kind = ?
 }
 
 fn stage1_output_from_row_and_thread(
-    row: &sqlx::sqlite::SqliteRow,
+    row: &crate::db::Row,
     thread: ThreadMetadata,
 ) -> anyhow::Result<Stage1Output> {
     let source_updated_at: i64 = row.try_get("source_updated_at")?;
@@ -1444,9 +1444,9 @@ async fn enqueue_global_consolidation_with_executor<'e, E>(
     input_watermark: i64,
 ) -> anyhow::Result<()>
 where
-    E: Executor<'e, Database = Sqlite>,
+    E: Executor<'e, Database = sqlx::Any>,
 {
-    sqlx::query(
+    crate::db::query(
         r#"
 INSERT INTO jobs (
     kind,
@@ -1472,7 +1472,7 @@ ON CONFLICT(kind, job_key) DO UPDATE SET
         WHEN jobs.status = 'running' THEN jobs.retry_at
         ELSE NULL
     END,
-    retry_remaining = max(jobs.retry_remaining, excluded.retry_remaining),
+    retry_remaining = GREATEST(jobs.retry_remaining, excluded.retry_remaining),
     input_watermark = CASE
         WHEN excluded.input_watermark > COALESCE(jobs.input_watermark, 0)
             THEN excluded.input_watermark
@@ -1691,12 +1691,12 @@ mod tests {
         ThreadId::from_string(value).expect("thread id")
     }
 
-    fn memory_pool(runtime: &StateRuntime) -> &sqlx::SqlitePool {
+    fn memory_pool(runtime: &StateRuntime) -> &crate::db::Pool {
         runtime.memories().pool.as_ref()
     }
 
     async fn age_phase2_success_beyond_cooldown(runtime: &StateRuntime) {
-        sqlx::query("UPDATE jobs SET finished_at = ? WHERE kind = ? AND job_key = ?")
+        crate::db::query("UPDATE jobs SET finished_at = ? WHERE kind = ? AND job_key = ?")
             .bind(Utc::now().timestamp() - PHASE2_SUCCESS_COOLDOWN_SECONDS - 1)
             .bind(JOB_KIND_MEMORY_CONSOLIDATE_GLOBAL)
             .bind(MEMORY_CONSOLIDATION_JOB_KEY)
@@ -1813,11 +1813,13 @@ mod tests {
             .expect("claim b fresh");
         assert_eq!(claim_b_fresh, Stage1JobClaimOutcome::SkippedRunning);
 
-        sqlx::query("UPDATE jobs SET lease_until = 0 WHERE kind = 'memory_stage1' AND job_key = ?")
-            .bind(thread_id.to_string())
-            .execute(memory_pool(&runtime))
-            .await
-            .expect("force stale lease");
+        crate::db::query(
+            "UPDATE jobs SET lease_until = 0 WHERE kind = 'memory_stage1' AND job_key = ?",
+        )
+        .bind(thread_id.to_string())
+        .execute(memory_pool(&runtime))
+        .await
+        .expect("force stale lease");
 
         let claim_b_stale = runtime
             .try_claim_stage1_job(
@@ -2227,7 +2229,7 @@ mod tests {
             .upsert_thread(&disabled)
             .await
             .expect("upsert disabled thread");
-        sqlx::query("UPDATE threads SET memory_mode = 'disabled' WHERE id = ?")
+        crate::db::query("UPDATE threads SET memory_mode = 'disabled' WHERE id = ?")
             .bind(disabled_thread_id.to_string())
             .execute(runtime.pool.as_ref())
             .await
@@ -2353,7 +2355,7 @@ mod tests {
             .upsert_thread(&disabled)
             .await
             .expect("upsert disabled thread");
-        sqlx::query("UPDATE threads SET memory_mode = 'disabled' WHERE id = ?")
+        crate::db::query("UPDATE threads SET memory_mode = 'disabled' WHERE id = ?")
             .bind(disabled_thread_id.to_string())
             .execute(runtime.pool.as_ref())
             .await
@@ -2364,14 +2366,15 @@ mod tests {
             .await
             .expect("clear memory data");
 
-        let stage1_outputs_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM stage1_outputs")
-            .fetch_one(memory_pool(&runtime))
-            .await
-            .expect("count stage1 outputs");
+        let stage1_outputs_count: i64 =
+            crate::db::query_scalar("SELECT COUNT(*) FROM stage1_outputs")
+                .fetch_one(memory_pool(&runtime))
+                .await
+                .expect("count stage1 outputs");
         assert_eq!(stage1_outputs_count, 0);
 
         let memory_jobs_count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE kind = ? OR kind = ?")
+            crate::db::query_scalar("SELECT COUNT(*) FROM jobs WHERE kind = ? OR kind = ?")
                 .bind(JOB_KIND_MEMORY_STAGE1)
                 .bind(JOB_KIND_MEMORY_CONSOLIDATE_GLOBAL)
                 .fetch_one(memory_pool(&runtime))
@@ -2380,7 +2383,7 @@ mod tests {
         assert_eq!(memory_jobs_count, 0);
 
         let enabled_memory_mode: String =
-            sqlx::query_scalar("SELECT memory_mode FROM threads WHERE id = ?")
+            crate::db::query_scalar("SELECT memory_mode FROM threads WHERE id = ?")
                 .bind(enabled_thread_id.to_string())
                 .fetch_one(runtime.pool.as_ref())
                 .await
@@ -2388,7 +2391,7 @@ mod tests {
         assert_eq!(enabled_memory_mode, "enabled");
 
         let disabled_memory_mode: String =
-            sqlx::query_scalar("SELECT memory_mode FROM threads WHERE id = ?")
+            crate::db::query_scalar("SELECT memory_mode FROM threads WHERE id = ?")
                 .bind(disabled_thread_id.to_string())
                 .fetch_one(runtime.pool.as_ref())
                 .await
@@ -2441,7 +2444,7 @@ mod tests {
                 .expect("upsert thread");
 
             if idx < existing_running {
-                sqlx::query(
+                crate::db::query(
                     r#"
 INSERT INTO jobs (
     kind,
@@ -2491,7 +2494,7 @@ INSERT INTO jobs (
             .expect("claim stage1 jobs");
         assert_eq!(claims.len(), 54);
 
-        let running_count = sqlx::query(
+        let running_count = crate::db::query(
             r#"
 SELECT COUNT(*) AS count
 FROM jobs
@@ -2663,7 +2666,7 @@ WHERE kind = 'memory_stage1'
         );
 
         let count_before =
-            sqlx::query("SELECT COUNT(*) AS count FROM stage1_outputs WHERE thread_id = ?")
+            crate::db::query("SELECT COUNT(*) AS count FROM stage1_outputs WHERE thread_id = ?")
                 .bind(thread_id.to_string())
                 .fetch_one(memory_pool(&runtime))
                 .await
@@ -2709,7 +2712,7 @@ WHERE kind = 'memory_stage1'
         );
 
         let count_after =
-            sqlx::query("SELECT COUNT(*) AS count FROM stage1_outputs WHERE thread_id = ?")
+            crate::db::query("SELECT COUNT(*) AS count FROM stage1_outputs WHERE thread_id = ?")
                 .bind(thread_id.to_string())
                 .fetch_one(memory_pool(&runtime))
                 .await
@@ -2718,7 +2721,7 @@ WHERE kind = 'memory_stage1'
                 .expect("count value");
         assert_eq!(count_after, 0);
 
-        let phase2_job = sqlx::query(
+        let phase2_job = crate::db::query(
             r#"
 SELECT status, input_watermark
 FROM jobs
@@ -2788,7 +2791,7 @@ WHERE kind = ? AND job_key = ?
         );
 
         let output_row_count =
-            sqlx::query("SELECT COUNT(*) AS count FROM stage1_outputs WHERE thread_id = ?")
+            crate::db::query("SELECT COUNT(*) AS count FROM stage1_outputs WHERE thread_id = ?")
                 .bind(thread_id.to_string())
                 .fetch_one(memory_pool(&runtime))
                 .await
@@ -2809,13 +2812,14 @@ WHERE kind = ? AND job_key = ?
             .expect("claim stage1 up-to-date");
         assert_eq!(up_to_date, Stage1JobClaimOutcome::SkippedUpToDate);
 
-        let global_job_row_count = sqlx::query("SELECT COUNT(*) AS count FROM jobs WHERE kind = ?")
-            .bind("memory_consolidate_global")
-            .fetch_one(memory_pool(&runtime))
-            .await
-            .expect("load phase2 job row count")
-            .try_get::<i64, _>("count")
-            .expect("phase2 job row count");
+        let global_job_row_count =
+            crate::db::query("SELECT COUNT(*) AS count FROM jobs WHERE kind = ?")
+                .bind("memory_consolidate_global")
+                .fetch_one(memory_pool(&runtime))
+                .await
+                .expect("load phase2 job row count")
+                .try_get::<i64, _>("count")
+                .expect("phase2 job row count");
         assert_eq!(
             global_job_row_count, 0,
             "no-output without an existing stage1 output should not enqueue phase2"
@@ -2916,7 +2920,7 @@ WHERE kind = ? AND job_key = ?
         );
 
         let output_row_count =
-            sqlx::query("SELECT COUNT(*) AS count FROM stage1_outputs WHERE thread_id = ?")
+            crate::db::query("SELECT COUNT(*) AS count FROM stage1_outputs WHERE thread_id = ?")
                 .bind(thread_id.to_string())
                 .fetch_one(memory_pool(&runtime))
                 .await
@@ -3027,7 +3031,7 @@ WHERE kind = ? AND job_key = ?
             "newer source watermark should reset retry budget and be claimable"
         );
 
-        let job_row = sqlx::query(
+        let job_row = crate::db::query(
             "SELECT retry_remaining, input_watermark FROM jobs WHERE kind = ? AND job_key = ?",
         )
         .bind("memory_stage1")
@@ -3161,7 +3165,7 @@ WHERE kind = ? AND job_key = ?
         }
 
         let job_row =
-            sqlx::query("SELECT retry_remaining FROM jobs WHERE kind = ? AND job_key = ?")
+            crate::db::query("SELECT retry_remaining FROM jobs WHERE kind = ? AND job_key = ?")
                 .bind("memory_consolidate_global")
                 .bind("global")
                 .fetch_one(memory_pool(&runtime))
@@ -3326,7 +3330,7 @@ WHERE kind = ? AND job_key = ?
             .await
             .expect("upsert empty thread");
 
-        sqlx::query(
+        crate::db::query(
             r#"
 INSERT INTO stage1_outputs (thread_id, source_updated_at, raw_memory, rollout_summary, generated_at)
 VALUES (?, ?, ?, ?, ?)
@@ -3340,7 +3344,7 @@ VALUES (?, ?, ?, ?, ?)
         .execute(memory_pool(&runtime))
         .await
         .expect("insert non-empty stage1 output");
-        sqlx::query(
+        crate::db::query(
             r#"
 INSERT INTO stage1_outputs (thread_id, source_updated_at, raw_memory, rollout_summary, generated_at)
 VALUES (?, ?, ?, ?, ?)
@@ -3817,7 +3821,7 @@ VALUES (?, ?, ?, ?, ?)
             "phase2 success should persist selected rows"
         );
 
-        sqlx::query("UPDATE threads SET memory_mode = 'polluted' WHERE id = ?")
+        crate::db::query("UPDATE threads SET memory_mode = 'polluted' WHERE id = ?")
             .bind(thread_id.to_string())
             .execute(runtime.pool.as_ref())
             .await
@@ -4473,18 +4477,20 @@ VALUES (?, ?, ?, ?, ?)
             .expect("record stage1 output usage");
         assert_eq!(updated_rows, 3);
 
-        let row_a =
-            sqlx::query("SELECT usage_count, last_usage FROM stage1_outputs WHERE thread_id = ?")
-                .bind(thread_a.to_string())
-                .fetch_one(memory_pool(&runtime))
-                .await
-                .expect("load stage1 usage row a");
-        let row_b =
-            sqlx::query("SELECT usage_count, last_usage FROM stage1_outputs WHERE thread_id = ?")
-                .bind(thread_b.to_string())
-                .fetch_one(memory_pool(&runtime))
-                .await
-                .expect("load stage1 usage row b");
+        let row_a = crate::db::query(
+            "SELECT usage_count, last_usage FROM stage1_outputs WHERE thread_id = ?",
+        )
+        .bind(thread_a.to_string())
+        .fetch_one(memory_pool(&runtime))
+        .await
+        .expect("load stage1 usage row a");
+        let row_b = crate::db::query(
+            "SELECT usage_count, last_usage FROM stage1_outputs WHERE thread_id = ?",
+        )
+        .bind(thread_b.to_string())
+        .fetch_one(memory_pool(&runtime))
+        .await
+        .expect("load stage1 usage row b");
 
         assert_eq!(
             row_a
@@ -4579,7 +4585,7 @@ VALUES (?, ?, ?, ?, ?)
             (thread_b, 5_i64, now - Duration::days(1)),
             (thread_c, 1_i64, now - Duration::hours(1)),
         ] {
-            sqlx::query(
+            crate::db::query(
                 "UPDATE stage1_outputs SET usage_count = ?, last_usage = ? WHERE thread_id = ?",
             )
             .bind(usage_count)
@@ -4678,7 +4684,7 @@ VALUES (?, ?, ?, ?, ?)
             (thread_b, None, None),
             (thread_c, Some(1_i64), Some(now - Duration::days(1))),
         ] {
-            sqlx::query(
+            crate::db::query(
                 "UPDATE stage1_outputs SET usage_count = ?, last_usage = ? WHERE thread_id = ?",
             )
             .bind(usage_count)
@@ -4769,13 +4775,13 @@ VALUES (?, ?, ?, ?, ?)
             );
         }
 
-        sqlx::query("UPDATE stage1_outputs SET generated_at = ? WHERE thread_id = ?")
+        crate::db::query("UPDATE stage1_outputs SET generated_at = ? WHERE thread_id = ?")
             .bind(300_i64)
             .bind(older_thread.to_string())
             .execute(memory_pool(&runtime))
             .await
             .expect("update older generated_at");
-        sqlx::query("UPDATE stage1_outputs SET generated_at = ? WHERE thread_id = ?")
+        crate::db::query("UPDATE stage1_outputs SET generated_at = ? WHERE thread_id = ?")
             .bind(150_i64)
             .bind(newer_thread.to_string())
             .execute(memory_pool(&runtime))
@@ -4881,7 +4887,7 @@ VALUES (?, ?, ?, ?, ?)
             );
         }
 
-        sqlx::query(
+        crate::db::query(
             "UPDATE stage1_outputs SET usage_count = ?, last_usage = ? WHERE thread_id = ?",
         )
         .bind(3_i64)
@@ -4890,14 +4896,14 @@ VALUES (?, ?, ?, ?, ?)
         .execute(memory_pool(&runtime))
         .await
         .expect("set stale used metadata");
-        sqlx::query(
+        crate::db::query(
             "UPDATE stage1_outputs SET selected_for_phase2 = 1, selected_for_phase2_source_updated_at = source_updated_at WHERE thread_id = ?",
         )
         .bind(stale_selected.to_string())
         .execute(memory_pool(&runtime))
         .await
         .expect("mark selected for phase2");
-        sqlx::query(
+        crate::db::query(
             "UPDATE stage1_outputs SET usage_count = ?, last_usage = ? WHERE thread_id = ?",
         )
         .bind(8_i64)
@@ -5011,7 +5017,7 @@ VALUES (?, ?, ?, ?, ?)
             .expect("prune stage1 outputs with limit");
         assert_eq!(pruned, 2);
 
-        let remaining_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM stage1_outputs")
+        let remaining_count: i64 = crate::db::query_scalar("SELECT COUNT(*) FROM stage1_outputs")
             .fetch_one(memory_pool(&runtime))
             .await
             .expect("count remaining stage1 outputs");
@@ -5236,7 +5242,7 @@ VALUES (?, ?, ?, ?, ?)
             other => panic!("unexpected initial claim outcome: {other:?}"),
         };
 
-        sqlx::query("UPDATE jobs SET lease_until = ? WHERE kind = ? AND job_key = ?")
+        crate::db::query("UPDATE jobs SET lease_until = ? WHERE kind = ? AND job_key = ?")
             .bind(Utc::now().timestamp() - 1)
             .bind("memory_consolidate_global")
             .bind("global")
@@ -5379,7 +5385,7 @@ VALUES (?, ?, ?, ?, ?)
             other => panic!("unexpected claim outcome: {other:?}"),
         };
 
-        sqlx::query("UPDATE jobs SET ownership_token = NULL WHERE kind = ? AND job_key = ?")
+        crate::db::query("UPDATE jobs SET ownership_token = NULL WHERE kind = ? AND job_key = ?")
             .bind("memory_consolidate_global")
             .bind("global")
             .execute(memory_pool(&runtime))

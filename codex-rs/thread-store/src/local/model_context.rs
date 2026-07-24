@@ -35,6 +35,12 @@ pub(super) async fn load_latest_model_context(
     store: &LocalThreadStore,
     params: LoadThreadHistoryParams,
 ) -> ThreadStoreResult<StoredModelContext> {
+    if store.postgres_canonical() {
+        return Ok(StoredModelContext {
+            thread_id: params.thread_id,
+            items: super::thread_history::load_rollout_items(store, params.thread_id).await?,
+        });
+    }
     let path = read_thread::resolve_rollout_path(store, params.thread_id, params.include_archived)
         .await?
         .ok_or_else(|| ThreadStoreError::InvalidRequest {

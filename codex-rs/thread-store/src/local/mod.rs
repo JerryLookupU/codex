@@ -11,7 +11,7 @@ mod read_thread;
 mod rollout_lineage;
 mod search_threads;
 mod thread_history;
-mod thread_history_materialization;
+pub mod thread_history_materialization;
 mod unarchive_thread;
 mod update_thread_metadata;
 mod writer_lock;
@@ -83,11 +83,12 @@ pub struct LocalThreadStore {
     live_writer_locks: Arc<LiveWriterLocks>,
     writer_lock_coordinator: Arc<WriterLockCoordinator>,
     state_db: Option<StateDbHandle>,
-    thread_history_db: Arc<OnceCell<sqlx::SqlitePool>>,
+    thread_history_db: Arc<OnceCell<codex_state::db::Pool>>,
 }
 
 struct LiveRecorderEntry {
-    recorder: RolloutRecorder,
+    recorder: Option<RolloutRecorder>,
+    pending_session_meta: Option<codex_protocol::protocol::SessionMetaLine>,
     // Local rollout files are materialized lazily, but metadata updates can arrive before the
     // canonical SessionMeta is durable. Retain the mode captured when live persistence was opened
     // so missing SQLite rows can still be seeded.
@@ -164,7 +165,7 @@ impl LocalThreadStore {
         self.state_db.clone()
     }
 
-    async fn thread_history_db(&self) -> ThreadStoreResult<&sqlx::SqlitePool> {
+    async fn thread_history_db(&self) -> ThreadStoreResult<&codex_state::db::Pool> {
         self.thread_history_db
             .get_or_try_init(|| async {
                 codex_state::open_thread_history_db(&self.config.sqlite).await
@@ -257,7 +258,8 @@ impl LocalThreadStore {
             }),
             Entry::Vacant(entry) => {
                 entry.insert(LiveRecorderEntry {
-                    recorder,
+                    recorder: Some(recorder),
+                    pending_session_meta: None,
                     history_mode,
                     writer_lock,
                 });
@@ -266,10 +268,46 @@ impl LocalThreadStore {
         }
     }
 
+    pub(super) async fn insert_postgres_live_recorder(
+        &self,
+        thread_id: ThreadId,
+        session_meta: Option<codex_protocol::protocol::SessionMetaLine>,
+        history_mode: ThreadHistoryMode,
+    ) -> ThreadStoreResult<()> {
+        match self.live_recorders.lock().await.entry(thread_id) {
+            Entry::Occupied(entry) => Err(ThreadStoreError::InvalidRequest {
+                message: format!(
+                    "thread {} already has a live PostgreSQL writer",
+                    entry.key()
+                ),
+            }),
+            Entry::Vacant(entry) => {
+                entry.insert(LiveRecorderEntry {
+                    recorder: None,
+                    pending_session_meta: session_meta,
+                    history_mode,
+                    writer_lock: None,
+                });
+                Ok(())
+            }
+        }
+    }
+
+    pub(super) fn postgres_canonical(&self) -> bool {
+        std::env::var("CODEX_STATE_BACKEND")
+            .is_ok_and(|value| value.trim().eq_ignore_ascii_case("postgres-only"))
+    }
+
     async fn load_history(
         &self,
         params: LoadThreadHistoryParams,
     ) -> ThreadStoreResult<StoredThreadHistory> {
+        if self.postgres_canonical() {
+            return Ok(StoredThreadHistory {
+                thread_id: params.thread_id,
+                items: thread_history::load_rollout_items(self, params.thread_id).await?,
+            });
+        }
         if let Ok(rollout_path) = live_writer::rollout_path(self, params.thread_id).await {
             if !params.include_archived
                 && helpers::rollout_path_is_archived(
@@ -347,11 +385,23 @@ impl ThreadStore for LocalThreadStore {
     }
 
     fn create_thread(&self, params: CreateThreadParams) -> ThreadStoreFuture<'_, ()> {
-        Box::pin(async move { live_writer::create_thread(self, params).await })
+        Box::pin(async move {
+            if self.postgres_canonical() {
+                create_thread::create_postgres_thread(self, params).await
+            } else {
+                live_writer::create_thread(self, params).await
+            }
+        })
     }
 
     fn resume_thread(&self, params: ResumeThreadParams) -> ThreadStoreFuture<'_, ()> {
-        Box::pin(async move { live_writer::resume_thread(self, params).await })
+        Box::pin(async move {
+            if self.postgres_canonical() {
+                live_writer::resume_postgres_thread(self, params).await
+            } else {
+                live_writer::resume_thread(self, params).await
+            }
+        })
     }
 
     fn append_items(&self, params: AppendThreadItemsParams) -> ThreadStoreFuture<'_, ()> {

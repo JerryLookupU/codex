@@ -18,8 +18,11 @@ use crate::ThreadStoreResult;
 
 pub(super) async fn list_threads(
     store: &LocalThreadStore,
-    params: ListThreadsParams,
+    mut params: ListThreadsParams,
 ) -> ThreadStoreResult<ThreadPage> {
+    if store.postgres_canonical() {
+        params.use_state_db_only = true;
+    }
     let cursor = params
         .cursor
         .as_deref()

@@ -4111,7 +4111,9 @@ dependencies = [
 name = "codex-thread-store"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
  "chrono",
+ "clap",
  "codex-app-server-protocol",
  "codex-git-utils",
  "codex-install-context",

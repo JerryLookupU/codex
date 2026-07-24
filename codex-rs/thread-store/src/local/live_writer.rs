@@ -118,6 +118,25 @@ pub(super) async fn resume_thread(
         .await
 }
 
+pub(super) async fn resume_postgres_thread(
+    store: &LocalThreadStore,
+    params: ResumeThreadParams,
+) -> ThreadStoreResult<()> {
+    let _live_writer_guard = store.live_writer_locks.lock(params.thread_id).await;
+    store.ensure_live_recorder_absent(params.thread_id).await?;
+    let history_mode = if let Some(history) = params.history.as_deref() {
+        canonical_history_mode_from_rollout_items(history)
+    } else {
+        super::thread_history::load_session_meta(store, params.thread_id)
+            .await?
+            .map(|meta| meta.meta.history_mode)
+            .unwrap_or_default()
+    };
+    store
+        .insert_postgres_live_recorder(params.thread_id, None, history_mode)
+        .await
+}
+
 #[tracing::instrument(
     level = "trace",
     skip_all,
@@ -127,6 +146,9 @@ pub(super) async fn append_items(
     store: &LocalThreadStore,
     params: AppendThreadItemsParams,
 ) -> ThreadStoreResult<()> {
+    if store.postgres_canonical() {
+        return write_postgres(store, params.thread_id, params.items).await;
+    }
     write_and_project(
         store,
         params.thread_id,
@@ -139,6 +161,9 @@ pub(super) async fn persist_thread(
     store: &LocalThreadStore,
     thread_id: ThreadId,
 ) -> ThreadStoreResult<()> {
+    if store.postgres_canonical() {
+        return write_postgres(store, thread_id, Vec::new()).await;
+    }
     write_and_project(store, thread_id, RolloutWriteOp::Persist).await
 }
 
@@ -146,6 +171,9 @@ pub(super) async fn flush_thread(
     store: &LocalThreadStore,
     thread_id: ThreadId,
 ) -> ThreadStoreResult<()> {
+    if store.postgres_canonical() {
+        return write_postgres(store, thread_id, Vec::new()).await;
+    }
     write_and_project(store, thread_id, RolloutWriteOp::Flush).await
 }
 
@@ -153,6 +181,12 @@ pub(super) async fn shutdown_thread(
     store: &LocalThreadStore,
     thread_id: ThreadId,
 ) -> ThreadStoreResult<()> {
+    if store.postgres_canonical() {
+        let _live_writer_guard = store.live_writer_locks.lock(thread_id).await;
+        write_postgres_locked(store, thread_id, Vec::new()).await?;
+        store.live_recorders.lock().await.remove(&thread_id);
+        return Ok(());
+    }
     let _live_writer_guard = store.live_writer_locks.lock(thread_id).await;
     let (recorder, history_mode) = live_writer_parts(store, thread_id).await?;
     let rollout_path = recorder.rollout_path().to_path_buf();
@@ -199,15 +233,17 @@ pub(super) async fn rollout_path(
     store: &LocalThreadStore,
     thread_id: ThreadId,
 ) -> ThreadStoreResult<PathBuf> {
-    Ok(store
-        .live_recorders
-        .lock()
-        .await
+    let live_recorders = store.live_recorders.lock().await;
+    let entry = live_recorders
         .get(&thread_id)
-        .ok_or(ThreadStoreError::ThreadNotFound { thread_id })?
+        .ok_or(ThreadStoreError::ThreadNotFound { thread_id })?;
+    entry
         .recorder
-        .rollout_path()
-        .to_path_buf())
+        .as_ref()
+        .map(|recorder| recorder.rollout_path().to_path_buf())
+        .ok_or(ThreadStoreError::Unsupported {
+            operation: "PostgreSQL canonical rollouts do not expose a local path",
+        })
 }
 
 async fn sync_materialized_rollout_path(
@@ -282,7 +318,51 @@ async fn live_writer_parts(
     let entry = live_recorders
         .get(&thread_id)
         .ok_or(ThreadStoreError::ThreadNotFound { thread_id })?;
-    Ok((entry.recorder.clone(), entry.history_mode))
+    let recorder = entry
+        .recorder
+        .clone()
+        .ok_or(ThreadStoreError::Unsupported {
+            operation: "local JSONL writer is disabled in PostgreSQL-only mode",
+        })?;
+    Ok((recorder, entry.history_mode))
+}
+
+async fn write_postgres(
+    store: &LocalThreadStore,
+    thread_id: ThreadId,
+    items: Vec<RolloutItem>,
+) -> ThreadStoreResult<()> {
+    let _live_writer_guard = store.live_writer_locks.lock(thread_id).await;
+    write_postgres_locked(store, thread_id, items).await
+}
+
+async fn write_postgres_locked(
+    store: &LocalThreadStore,
+    thread_id: ThreadId,
+    items: Vec<RolloutItem>,
+) -> ThreadStoreResult<()> {
+    let (session_meta, history_mode) = {
+        let live_recorders = store.live_recorders.lock().await;
+        let entry = live_recorders
+            .get(&thread_id)
+            .ok_or(ThreadStoreError::ThreadNotFound { thread_id })?;
+        (entry.pending_session_meta.clone(), entry.history_mode)
+    };
+    let mut persisted = Vec::new();
+    if let Some(session_meta) = session_meta.as_ref() {
+        persisted.push(RolloutItem::SessionMeta(session_meta.clone()));
+    }
+    persisted.extend(persisted_rollout_items(&items, history_mode));
+    if persisted.is_empty() {
+        return Ok(());
+    }
+    super::thread_history::append_rollout_items(store, thread_id, persisted).await?;
+    if session_meta.is_some()
+        && let Some(entry) = store.live_recorders.lock().await.get_mut(&thread_id)
+    {
+        entry.pending_session_meta = None;
+    }
+    Ok(())
 }
 
 async fn write_and_project(

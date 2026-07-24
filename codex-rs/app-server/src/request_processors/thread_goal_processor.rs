@@ -274,7 +274,7 @@ impl ThreadGoalRequestProcessor {
         thread_id: ThreadId,
     ) -> Result<StateDbHandle, JSONRPCErrorError> {
         if let Ok(thread) = self.thread_manager.get_thread(thread_id).await {
-            if thread.rollout_path().is_none() {
+            if thread.config_snapshot().await.ephemeral {
                 return Err(invalid_request(format!(
                     "ephemeral thread does not support goals: {thread_id}"
                 )));
@@ -282,6 +282,11 @@ impl ThreadGoalRequestProcessor {
             if let Some(state_db) = thread.state_db() {
                 return Ok(state_db);
             }
+        } else if postgres_canonical() {
+            return self
+                .state_db
+                .clone()
+                .ok_or_else(|| internal_error("PostgreSQL state db unavailable for thread goals"));
         } else {
             codex_rollout::find_thread_path_by_id_str(
                 &self.config.codex_home,
@@ -306,6 +311,16 @@ impl ThreadGoalRequestProcessor {
         state_db: &StateDbHandle,
     ) -> Result<(), JSONRPCErrorError> {
         let running_thread = self.thread_manager.get_thread(thread_id).await.ok();
+        if postgres_canonical() {
+            if let Some(thread) = running_thread.as_ref() {
+                if thread.config_snapshot().await.ephemeral {
+                    return Err(invalid_request(format!(
+                        "ephemeral thread does not support goals: {thread_id}"
+                    )));
+                }
+            }
+            return Ok(());
+        }
         let rollout_path = match running_thread.as_ref() {
             Some(thread) => thread.rollout_path().ok_or_else(|| {
                 invalid_request(format!(
@@ -417,6 +432,11 @@ impl ThreadGoalRequestProcessor {
             ))
             .await;
     }
+}
+
+fn postgres_canonical() -> bool {
+    std::env::var("CODEX_STATE_BACKEND")
+        .is_ok_and(|value| value.eq_ignore_ascii_case("postgres-only"))
 }
 
 fn thread_settings_applied_item(thread_settings: ThreadSettingsSnapshot) -> RolloutItem {

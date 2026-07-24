@@ -82,6 +82,26 @@ pub(super) async fn update_thread_metadata(
         history_mode,
     )
     .await?;
+    if store.postgres_canonical() {
+        if let Some(git_info) = patch.git_info.as_ref() {
+            let Some(state_db) = store.state_db().await else {
+                return Err(ThreadStoreError::Internal {
+                    message: format!("PostgreSQL state store unavailable for thread {thread_id}"),
+                });
+            };
+            apply_thread_git_info_patch(state_db.as_ref(), thread_id, git_info).await?;
+            updated = read_thread::read_thread(
+                store,
+                ReadThreadParams {
+                    thread_id,
+                    include_archived: params.include_archived,
+                    include_history: false,
+                },
+            )
+            .await?;
+        }
+        return Ok(updated);
+    }
     if paginated
         && requires_rollout_compat
         && let Some(git_info) = patch.git_info.as_ref()
@@ -255,7 +275,11 @@ async fn apply_metadata_update(
     require_sqlite_write: bool,
     history_mode: Option<ThreadHistoryMode>,
 ) -> ThreadStoreResult<StoredThread> {
-    let live_rollout_path = live_writer::rollout_path(store, thread_id).await.ok();
+    let live_rollout_path = if store.postgres_canonical() {
+        Some(PathBuf::from(format!("pg://thread/{thread_id}")))
+    } else {
+        live_writer::rollout_path(store, thread_id).await.ok()
+    };
     let mut rollout_path = patch.rollout_path.clone().or(live_rollout_path);
     let mut rollout_path_archived = rollout_path
         .as_deref()
@@ -524,7 +548,14 @@ async fn metadata_for_missing_sqlite_row(
         patch.source.clone().unwrap_or(SessionSource::Unknown),
     );
     builder.model_provider = patch.model_provider.clone();
-    builder.history_mode = canonical_history_mode(store, thread_id, rollout_path).await?;
+    builder.history_mode = if store.postgres_canonical() {
+        super::thread_history::load_session_meta(store, thread_id)
+            .await?
+            .map(|meta| meta.meta.history_mode)
+            .unwrap_or_default()
+    } else {
+        canonical_history_mode(store, thread_id, rollout_path).await?
+    };
     builder.thread_source = patch.thread_source.clone().flatten();
     builder.agent_nickname = patch.agent_nickname.clone().flatten();
     builder.agent_role = patch.agent_role.clone().flatten();

@@ -332,6 +332,9 @@ impl LiveThread {
         else {
             return Ok(None);
         };
+        if local_store.postgres_canonical() {
+            return Ok(None);
+        }
         local_store
             .live_rollout_path(self.thread_id)
             .await

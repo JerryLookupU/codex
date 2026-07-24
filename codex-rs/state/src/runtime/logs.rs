@@ -14,10 +14,10 @@ impl StateRuntime {
         }
 
         let mut tx = self.logs_pool.begin().await?;
-        let mut builder = QueryBuilder::<Sqlite>::new(
+        let mut builder = QueryBuilder::new(
             "INSERT INTO logs (ts, ts_nanos, level, target, feedback_log_body, thread_id, process_uuid, module_path, file, line, estimated_bytes) ",
         );
-        builder.push_values(entries, |mut row, entry| {
+        builder.push_values(entries, |row, entry| {
             let feedback_log_body = entry.feedback_log_body.as_ref().or(entry.message.as_ref());
             // Keep about 10 MiB of reader-visible log content per partition.
             // Both `query_logs` and `/feedback` read the persisted
@@ -62,7 +62,7 @@ impl StateRuntime {
     async fn prune_logs_after_insert(
         &self,
         entries: &[LogEntry],
-        tx: &mut SqliteConnection,
+        tx: &mut Connection,
     ) -> anyhow::Result<()> {
         let thread_ids: BTreeSet<&str> = entries
             .iter()
@@ -72,7 +72,7 @@ impl StateRuntime {
             // Cheap precheck: only run the heavier window-function prune for
             // threads that are currently above the cap.
             let mut over_limit_threads_query =
-                QueryBuilder::<Sqlite>::new("SELECT thread_id FROM logs WHERE thread_id IN (");
+                QueryBuilder::new("SELECT thread_id FROM logs WHERE thread_id IN (");
             {
                 let mut separated = over_limit_threads_query.separated(", ");
                 for thread_id in &thread_ids {
@@ -95,7 +95,7 @@ impl StateRuntime {
             if !over_limit_thread_ids.is_empty() {
                 // Enforce a strict per-thread cap by deleting every row whose
                 // newest-first cumulative bytes exceed the partition budget.
-                let mut prune_threads = QueryBuilder::<Sqlite>::new(
+                let mut prune_threads = QueryBuilder::new(
                     r#"
 DELETE FROM logs
 WHERE id IN (
@@ -152,7 +152,7 @@ WHERE id IN (
             .any(|entry| entry.thread_id.is_none() && entry.process_uuid.is_none());
         if !threadless_process_uuids.is_empty() {
             // Threadless logs are budgeted separately per process UUID.
-            let mut over_limit_processes_query = QueryBuilder::<Sqlite>::new(
+            let mut over_limit_processes_query = QueryBuilder::new(
                 "SELECT process_uuid FROM logs WHERE thread_id IS NULL AND process_uuid IN (",
             );
             {
@@ -177,7 +177,7 @@ WHERE id IN (
             if !over_limit_process_uuids.is_empty() {
                 // Same strict cap policy as thread pruning, but only for
                 // threadless rows in the affected process UUIDs.
-                let mut prune_threadless_process_logs = QueryBuilder::<Sqlite>::new(
+                let mut prune_threadless_process_logs = QueryBuilder::new(
                     r#"
 DELETE FROM logs
 WHERE id IN (
@@ -230,7 +230,7 @@ WHERE id IN (
         if has_threadless_null_process_uuid {
             // Rows without a process UUID still need a cap; treat NULL as its
             // own threadless partition.
-            let mut null_process_usage_query = QueryBuilder::<Sqlite>::new("SELECT SUM(");
+            let mut null_process_usage_query = QueryBuilder::new("SELECT SUM(");
             null_process_usage_query.push("estimated_bytes");
             null_process_usage_query.push(
                 ") AS total_bytes, COUNT(*) AS row_count FROM logs WHERE thread_id IS NULL AND process_uuid IS NULL",
@@ -243,7 +243,7 @@ WHERE id IN (
             if total_null_process_bytes.unwrap_or(0) > LOG_PARTITION_SIZE_LIMIT_BYTES
                 || null_process_row_count > LOG_PARTITION_ROW_LIMIT
             {
-                let mut prune_threadless_null_process_logs = QueryBuilder::<Sqlite>::new(
+                let mut prune_threadless_null_process_logs = QueryBuilder::new(
                     r#"
 DELETE FROM logs
 WHERE id IN (
@@ -286,7 +286,7 @@ WHERE id IN (
     }
 
     pub(crate) async fn delete_logs_before(&self, cutoff_ts: i64) -> anyhow::Result<u64> {
-        let result = sqlx::query("DELETE FROM logs WHERE ts < ?")
+        let result = crate::db::query("DELETE FROM logs WHERE ts < ?")
             .bind(cutoff_ts)
             .execute(self.logs_pool.as_ref())
             .await?;
@@ -300,10 +300,13 @@ WHERE id IN (
             return Ok(());
         };
         self.delete_logs_before(cutoff.timestamp()).await?;
+        if crate::postgres::configured() || crate::postgres::postgres_required() {
+            return Ok(());
+        }
         // Startup cleanup should not wait behind or block foreground work.
         // PASSIVE checkpoints copy whatever is immediately available and skip
         // frames that would require waiting on active readers or writers.
-        sqlx::query("PRAGMA wal_checkpoint(PASSIVE)")
+        crate::db::query("PRAGMA wal_checkpoint(PASSIVE)")
             .execute(self.logs_pool.as_ref())
             .await?;
         Ok(())
@@ -311,7 +314,7 @@ WHERE id IN (
 
     /// Query logs with optional filters.
     pub async fn query_logs(&self, query: &LogQuery) -> anyhow::Result<Vec<LogRow>> {
-        let mut builder = QueryBuilder::<Sqlite>::new(
+        let mut builder = QueryBuilder::new(
             "SELECT id, ts, ts_nanos, level, target, feedback_log_body AS message, thread_id, process_uuid, file, line FROM logs WHERE 1 = 1",
         );
         push_log_filters(&mut builder, query);
@@ -343,7 +346,7 @@ WHERE id IN (
         let max_bytes = usize::try_from(LOG_PARTITION_SIZE_LIMIT_BYTES).unwrap_or(usize::MAX);
         // Bound the fetched rows in SQL first so over-retained partitions do not have to load
         // every row into memory, then apply the exact whole-line byte cap after formatting.
-        let mut builder = QueryBuilder::<Sqlite>::new(
+        let mut builder = QueryBuilder::new(
             r#"
 WITH requested_threads(thread_id) AS (
     VALUES
@@ -437,8 +440,7 @@ WHERE cumulative_estimated_bytes <=
 
     /// Return the max log id matching optional filters.
     pub async fn max_log_id(&self, query: &LogQuery) -> anyhow::Result<i64> {
-        let mut builder =
-            QueryBuilder::<Sqlite>::new("SELECT MAX(id) AS max_id FROM logs WHERE 1 = 1");
+        let mut builder = QueryBuilder::new("SELECT MAX(id) AS max_id FROM logs WHERE 1 = 1");
         push_log_filters(&mut builder, query);
         let row = builder.build().fetch_one(self.logs_pool.as_ref()).await?;
         let max_id: Option<i64> = row.try_get("max_id")?;
@@ -472,7 +474,7 @@ fn format_feedback_log_line(
     line
 }
 
-fn push_log_filters(builder: &mut QueryBuilder<Sqlite>, query: &LogQuery) {
+fn push_log_filters(builder: &mut QueryBuilder, query: &LogQuery) {
     if !query.levels_upper.is_empty() {
         builder.push(" AND UPPER(level) IN (");
         {
@@ -514,13 +516,13 @@ fn push_log_filters(builder: &mut QueryBuilder<Sqlite>, query: &LogQuery) {
         builder.push(" AND id > ").push_bind(after_id);
     }
     if let Some(search) = query.search.as_ref() {
-        builder.push(" AND INSTR(COALESCE(feedback_log_body, ''), ");
+        builder.push(" AND POSITION(");
         builder.push_bind(search.as_str());
-        builder.push(") > 0");
+        builder.push(" IN COALESCE(feedback_log_body, '')) > 0");
     }
 }
 
-fn push_like_filters(builder: &mut QueryBuilder<Sqlite>, column: &str, filters: &[String]) {
+fn push_like_filters(builder: &mut QueryBuilder, column: &str, filters: &[String]) {
     if filters.is_empty() {
         return;
     }

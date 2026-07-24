@@ -9,11 +9,17 @@ name = "codex_thread_store"
 path = "src/lib.rs"
 doctest = false
 
+[[bin]]
+name = "project_legacy_history"
+path = "src/bin/project_legacy_history.rs"
+
 [lints]
 workspace = true
 
 [dependencies]
 chrono = { workspace = true, features = ["serde"] }
+anyhow = { workspace = true }
+clap = { workspace = true, features = ["derive", "env"] }
 codex-app-server-protocol = { workspace = true }
 codex-git-utils = { workspace = true }
 codex-install-context = { workspace = true }

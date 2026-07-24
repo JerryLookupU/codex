@@ -10,11 +10,13 @@ const _: () = assert!(
 );
 
 mod audit;
+pub mod db;
 mod extract;
 pub mod log_db;
 mod migrations;
 mod model;
 mod paths;
+pub mod postgres;
 mod runtime;
 mod sqlite;
 mod telemetry;

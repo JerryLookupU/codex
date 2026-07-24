@@ -1,6 +1,4 @@
 use codex_protocol::ThreadId;
-use sqlx::QueryBuilder;
-use sqlx::Sqlite;
 
 use super::super::rollout_lineage::RolloutLineage;
 use super::super::rollout_lineage::RolloutLineageSegment;
@@ -39,7 +37,7 @@ pub(super) fn validate_page_size(page_size: usize) -> ThreadStoreResult<()> {
 }
 
 pub(super) async fn page_turn_rows(
-    pool: &sqlx::SqlitePool,
+    pool: &codex_state::db::Pool,
     requested_thread_id: ThreadId,
     lineage: &RolloutLineage,
     cursor: Option<&str>,
@@ -53,7 +51,7 @@ pub(super) async fn page_turn_rows(
         if remaining == 0 {
             break;
         }
-        let mut query = QueryBuilder::<Sqlite>::new(
+        let mut query = codex_state::db::QueryBuilder::new(
             r#"
 SELECT
     turn_id,
@@ -88,7 +86,7 @@ WHERE thread_id =
 }
 
 pub(super) async fn page_item_rows(
-    pool: &sqlx::SqlitePool,
+    pool: &codex_state::db::Pool,
     lineage: &RolloutLineage,
     params: &ListItemsParams,
 ) -> ThreadStoreResult<SegmentPage<StoredThreadItemRow>> {
@@ -120,7 +118,7 @@ pub(super) async fn page_item_rows(
         if remaining == 0 {
             break;
         }
-        let mut query = QueryBuilder::<Sqlite>::new(
+        let mut query = codex_state::db::QueryBuilder::new(
             r#"
 SELECT turn_id, item_id, rollout_ordinal, updated_at_ordinal, created_at_ms, item_json
 FROM thread_items
@@ -159,7 +157,7 @@ WHERE thread_id =
 }
 
 async fn page_updated_item_rows(
-    pool: &sqlx::SqlitePool,
+    pool: &codex_state::db::Pool,
     params: &ListItemsParams,
     after_updated_at_ordinal: u64,
 ) -> ThreadStoreResult<SegmentPage<StoredThreadItemRow>> {
@@ -174,7 +172,7 @@ async fn page_updated_item_rows(
     {
         return Err(invalid_cursor("unknown physical segment"));
     }
-    let mut query = QueryBuilder::<Sqlite>::new(
+    let mut query = codex_state::db::QueryBuilder::new(
         r#"
 SELECT turn_id, item_id, updated_at_ordinal AS rollout_ordinal, updated_at_ordinal, created_at_ms, item_json
 FROM thread_items
@@ -275,7 +273,7 @@ fn cursor_in_segment(cursor: &HistoryCursor, segment: &RolloutLineageSegment) ->
 }
 
 fn push_segment_range(
-    query: &mut QueryBuilder<Sqlite>,
+    query: &mut codex_state::db::QueryBuilder,
     segment: &RolloutLineageSegment,
 ) -> ThreadStoreResult<()> {
     query
@@ -290,7 +288,7 @@ fn push_segment_range(
 }
 
 fn push_cursor_clause(
-    query: &mut QueryBuilder<Sqlite>,
+    query: &mut codex_state::db::QueryBuilder,
     direction: SortDirection,
     cursor: Option<&HistoryCursor>,
 ) -> ThreadStoreResult<()> {
@@ -310,7 +308,11 @@ fn push_cursor_clause(
     Ok(())
 }
 
-fn push_order_and_limit(query: &mut QueryBuilder<Sqlite>, direction: SortDirection, limit: i64) {
+fn push_order_and_limit(
+    query: &mut codex_state::db::QueryBuilder,
+    direction: SortDirection,
+    limit: i64,
+) {
     let order = match direction {
         SortDirection::Asc => "ASC",
         SortDirection::Desc => "DESC",

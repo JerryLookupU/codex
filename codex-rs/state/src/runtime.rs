@@ -7,6 +7,7 @@ use crate::ThreadMetadata;
 use crate::ThreadMetadataBuilder;
 use crate::ThreadsPage;
 use crate::apply_rollout_item;
+use crate::db::QueryBuilder;
 use crate::migrations::runtime_goals_migrator;
 use crate::migrations::runtime_logs_migrator;
 use crate::migrations::runtime_memories_migrator;
@@ -25,14 +26,12 @@ use chrono::Utc;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::RolloutItem;
 use serde_json::Value;
-use sqlx::QueryBuilder;
 use sqlx::Row;
-use sqlx::Sqlite;
-use sqlx::SqliteConnection;
-use sqlx::SqlitePool;
+
+use crate::db::Connection;
+use crate::db::Pool;
 use std::collections::BTreeSet;
 use std::path::Path;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicI64;
 use std::time::Instant;
@@ -81,8 +80,8 @@ const LOG_PARTITION_ROW_LIMIT: i64 = 1_000;
 pub struct StateRuntime {
     sqlite: SqliteConfig,
     default_provider: String,
-    pool: Arc<sqlx::SqlitePool>,
-    logs_pool: Arc<sqlx::SqlitePool>,
+    pool: Arc<Pool>,
+    logs_pool: Arc<Pool>,
     thread_goals: GoalStore,
     memories: MemoryStore,
     thread_updated_at_millis: Arc<AtomicI64>,
@@ -90,12 +89,11 @@ pub struct StateRuntime {
 }
 
 impl StateRuntime {
-    /// Initialize the state runtime using the provided SQLite configuration and default provider.
+    /// Initialize the state runtime using the provided storage configuration and default provider.
     ///
-    /// This opens (and migrates) the SQLite databases under the configured
-    /// `sqlite_home`.
-    /// Logs and paginated thread history live in dedicated files to reduce
-    /// lock contention with the rest of the state store.
+    /// PostgreSQL is selected when `CODEX_STATE_DATABASE_URL` is configured.
+    /// Otherwise this opens and migrates the SQLite databases under the
+    /// configured `sqlite_home`.
     pub async fn init(sqlite: SqliteConfig, default_provider: String) -> anyhow::Result<Arc<Self>> {
         Self::init_inner(sqlite, default_provider, /*telemetry_override*/ None).await
     }
@@ -115,60 +113,18 @@ impl StateRuntime {
         telemetry_override: Option<&dyn DbTelemetry>,
     ) -> anyhow::Result<Arc<Self>> {
         tokio::fs::create_dir_all(sqlite.home()).await?;
-        let state_migrator = runtime_state_migrator();
-        let logs_migrator = runtime_logs_migrator();
-        let goals_migrator = runtime_goals_migrator();
-        let memories_migrator = runtime_memories_migrator();
-        let state_path = sqlite.state_db_path();
-        let logs_path = sqlite.logs_db_path();
-        let goals_path = sqlite.goals_db_path();
-        let memories_path = sqlite.memories_db_path();
-        let pool = match sqlite
-            .open_state_db(&state_migrator, telemetry_override)
-            .await
-        {
-            Ok(db) => Arc::new(db),
-            Err(err) => {
-                warn!("failed to open state db at {}: {err}", state_path.display());
-                return Err(err);
-            }
-        };
-        let logs_pool = match sqlite
-            .open_logs_db(&logs_migrator, telemetry_override)
-            .await
-        {
-            Ok(db) => Arc::new(db),
-            Err(err) => {
-                warn!("failed to open logs db at {}: {err}", logs_path.display());
-                close_sqlite_pools(&[pool.as_ref()]).await;
-                return Err(err);
-            }
-        };
-        let goals_pool = match sqlite
-            .open_goals_db(&goals_migrator, telemetry_override)
-            .await
-        {
-            Ok(db) => Arc::new(db),
-            Err(err) => {
-                warn!("failed to open goals db at {}: {err}", goals_path.display());
-                close_sqlite_pools(&[pool.as_ref(), logs_pool.as_ref()]).await;
-                return Err(err);
-            }
-        };
-        let memories_pool = match sqlite
-            .open_memories_db(&memories_migrator, telemetry_override)
-            .await
-        {
-            Ok(db) => Arc::new(db),
-            Err(err) => {
-                warn!(
-                    "failed to open memories db at {}: {err}",
-                    memories_path.display()
-                );
-                close_sqlite_pools(&[pool.as_ref(), logs_pool.as_ref(), goals_pool.as_ref()]).await;
-                return Err(err);
-            }
-        };
+        let (pool, logs_pool, goals_pool, memories_pool) =
+            if crate::postgres::configured() || crate::postgres::postgres_required() {
+                let pool = Arc::new(crate::postgres::open_pool().await?);
+                (
+                    Arc::clone(&pool),
+                    Arc::clone(&pool),
+                    Arc::clone(&pool),
+                    pool,
+                )
+            } else {
+                open_sqlite_compatibility_pools(&sqlite, telemetry_override).await?
+            };
         let started = Instant::now();
         let backfill_state_result = ensure_backfill_state_row_in_pool(pool.as_ref()).await;
         crate::telemetry::record_init_result(
@@ -179,7 +135,7 @@ impl StateRuntime {
             &backfill_state_result,
         );
         if let Err(err) = backfill_state_result {
-            close_sqlite_pools(&[
+            close_pools(&[
                 pool.as_ref(),
                 logs_pool.as_ref(),
                 goals_pool.as_ref(),
@@ -190,7 +146,7 @@ impl StateRuntime {
         }
         let started = Instant::now();
         let thread_timestamp_millis_result: anyhow::Result<(Option<i64>, Option<i64>)> =
-            sqlx::query_as(
+            crate::db::query_as(
                 "SELECT MAX(threads.updated_at_ms), MAX(threads.recency_at_ms) FROM threads",
             )
             .fetch_one(pool.as_ref())
@@ -207,7 +163,7 @@ impl StateRuntime {
             match thread_timestamp_millis_result {
                 Ok(value) => value,
                 Err(err) => {
-                    close_sqlite_pools(&[
+                    close_pools(&[
                         pool.as_ref(),
                         logs_pool.as_ref(),
                         goals_pool.as_ref(),
@@ -230,10 +186,7 @@ impl StateRuntime {
             thread_recency_at_millis: Arc::new(AtomicI64::new(thread_recency_at_millis)),
         });
         if let Err(err) = runtime.run_logs_startup_maintenance().await {
-            warn!(
-                "failed to run startup maintenance for logs db at {}: {err}",
-                logs_path.display(),
-            );
+            warn!("failed to run startup maintenance for state logs: {err}");
         }
         Ok(runtime)
     }
@@ -260,6 +213,12 @@ impl StateRuntime {
     }
 
     pub async fn clear_memory_data_in_sqlite_home(sqlite: &SqliteConfig) -> anyhow::Result<bool> {
+        if crate::postgres::configured() || crate::postgres::postgres_required() {
+            let pool = crate::postgres::open_pool().await?;
+            memories::clear_memory_data_in_pool(&pool).await?;
+            pool.close().await;
+            return Ok(true);
+        }
         let memories_path = sqlite.memories_db_path();
         if !tokio::fs::try_exists(&memories_path).await? {
             return Ok(false);
@@ -269,32 +228,85 @@ impl StateRuntime {
         let pool = sqlite
             .open_memories_db(&memories_migrator, /*telemetry_override*/ None)
             .await?;
+        pool.close().await;
+        let pool = open_any_sqlite_pool(&memories_path).await?;
         memories::clear_memory_data_in_pool(&pool).await?;
         pool.close().await;
         Ok(true)
     }
 }
 
-async fn close_sqlite_pools(pools: &[&SqlitePool]) {
+async fn close_pools(pools: &[&Pool]) {
     for pool in pools {
         pool.close().await;
     }
 }
 
 /// Open and migrate the rebuildable paginated thread-history database.
-pub async fn open_thread_history_db(sqlite: &SqliteConfig) -> anyhow::Result<SqlitePool> {
+pub async fn open_thread_history_db(sqlite: &SqliteConfig) -> anyhow::Result<Pool> {
+    if crate::postgres::configured() || crate::postgres::postgres_required() {
+        return crate::postgres::open_pool().await;
+    }
     let migrator = runtime_thread_history_migrator();
-    sqlite
+    let pool = sqlite
         .open_thread_history_db(&migrator, /*telemetry_override*/ None)
-        .await
+        .await?;
+    pool.close().await;
+    open_any_sqlite_pool(&sqlite.thread_history_db_path()).await
 }
 
-pub(super) async fn ensure_backfill_state_row_in_pool(
-    pool: &sqlx::SqlitePool,
-) -> anyhow::Result<()> {
+async fn open_sqlite_compatibility_pools(
+    sqlite: &SqliteConfig,
+    telemetry_override: Option<&dyn DbTelemetry>,
+) -> anyhow::Result<(Arc<Pool>, Arc<Pool>, Arc<Pool>, Arc<Pool>)> {
+    let state_path = sqlite.state_db_path();
+    let logs_path = sqlite.logs_db_path();
+    let goals_path = sqlite.goals_db_path();
+    let memories_path = sqlite.memories_db_path();
+
+    sqlite
+        .open_state_db(&runtime_state_migrator(), telemetry_override)
+        .await?
+        .close()
+        .await;
+    sqlite
+        .open_logs_db(&runtime_logs_migrator(), telemetry_override)
+        .await?
+        .close()
+        .await;
+    sqlite
+        .open_goals_db(&runtime_goals_migrator(), telemetry_override)
+        .await?
+        .close()
+        .await;
+    sqlite
+        .open_memories_db(&runtime_memories_migrator(), telemetry_override)
+        .await?
+        .close()
+        .await;
+
+    Ok((
+        Arc::new(open_any_sqlite_pool(&state_path).await?),
+        Arc::new(open_any_sqlite_pool(&logs_path).await?),
+        Arc::new(open_any_sqlite_pool(&goals_path).await?),
+        Arc::new(open_any_sqlite_pool(&memories_path).await?),
+    ))
+}
+
+async fn open_any_sqlite_pool(path: &Path) -> anyhow::Result<Pool> {
+    sqlx::any::install_default_drivers();
+    let database_url = format!("sqlite://{}?mode=rwc", path.display());
+    sqlx::any::AnyPoolOptions::new()
+        .max_connections(5)
+        .connect(&database_url)
+        .await
+        .map_err(Into::into)
+}
+
+pub(super) async fn ensure_backfill_state_row_in_pool(pool: &Pool) -> anyhow::Result<()> {
     // Eagerly check if the operation would have no effect to avoid blocking waiting for a SQLite
     // writer for no reason in the hot startup path.
-    if sqlx::query_scalar::<_, i64>("SELECT 1 FROM backfill_state WHERE id = 1")
+    if crate::db::query_scalar::<i64>("SELECT 1 FROM backfill_state WHERE id = 1")
         .fetch_optional(pool)
         .await?
         .is_some()
@@ -302,7 +314,7 @@ pub(super) async fn ensure_backfill_state_row_in_pool(
         return Ok(());
     }
 
-    sqlx::query(
+    crate::db::query(
         r#"
 INSERT INTO backfill_state (id, status, last_watermark, last_success_at, updated_at)
 VALUES (?, ?, NULL, NULL, ?)

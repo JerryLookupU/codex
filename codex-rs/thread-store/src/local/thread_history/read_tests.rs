@@ -771,7 +771,7 @@ fn rollout_end_byte_offset(path: &std::path::Path, end_ordinal_exclusive: u64) -
     u64::try_from(end_byte_offset).expect("rollout byte offset fits u64")
 }
 
-async fn history_db(store: &LocalThreadStore) -> &sqlx::SqlitePool {
+async fn history_db(store: &LocalThreadStore) -> &codex_state::db::Pool {
     store
         .thread_history_db()
         .await
@@ -780,7 +780,7 @@ async fn history_db(store: &LocalThreadStore) -> &sqlx::SqlitePool {
 
 #[allow(clippy::too_many_arguments)]
 async fn insert_turn(
-    db: &sqlx::SqlitePool,
+    db: &codex_state::db::Pool,
     thread_id: ThreadId,
     turn_id: &str,
     rollout_ordinal: i64,
@@ -789,7 +789,7 @@ async fn insert_turn(
     first_user_item_id: Option<&str>,
     final_agent_item_id: Option<&str>,
 ) {
-    sqlx::query(
+    codex_state::db::query(
         r#"
 INSERT INTO thread_turns (
     thread_id,
@@ -815,13 +815,13 @@ INSERT INTO thread_turns (
 }
 
 async fn insert_item(
-    db: &sqlx::SqlitePool,
+    db: &codex_state::db::Pool,
     thread_id: ThreadId,
     turn_id: &str,
     item_id: &str,
     rollout_ordinal: i64,
 ) {
-    sqlx::query(
+    codex_state::db::query(
         "INSERT INTO thread_items (thread_id, turn_id, item_id, rollout_ordinal, updated_at_ordinal, created_at_ms, item_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(thread_id.to_string())

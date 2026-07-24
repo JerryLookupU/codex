@@ -1142,7 +1142,8 @@ async fn blank_and_rejected_rollout_lines_do_not_poison_projection() {
         .get(&thread_id)
         .expect("live recorder")
         .recorder
-        .clone();
+        .clone()
+        .expect("local rollout recorder");
     recorder
         .record_canonical_items(&[turn_started("turn-1")])
         .await
@@ -1184,7 +1185,8 @@ async fn shutdown_materializes_items_queued_without_a_flush() {
         .get(&thread_id)
         .expect("live recorder")
         .recorder
-        .clone();
+        .clone()
+        .expect("local rollout recorder");
     recorder
         .record_canonical_items(&[turn_started("turn-1")])
         .await
@@ -1372,8 +1374,8 @@ fn rollout_line_byte_offsets(path: &std::path::Path, ordinal: u64) -> (i64, i64)
     panic!("missing rollout ordinal {ordinal}");
 }
 
-async fn projection_state(pool: &sqlx::SqlitePool, thread_id: ThreadId) -> (i64, i64) {
-    sqlx::query_as::<_, (i64, i64)>(
+async fn projection_state(pool: &codex_state::db::Pool, thread_id: ThreadId) -> (i64, i64) {
+    codex_state::db::query_as::<(i64, i64)>(
         r#"
 SELECT next_rollout_byte_offset, next_rollout_ordinal
 FROM thread_history_projection_state

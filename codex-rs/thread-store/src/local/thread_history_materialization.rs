@@ -2,6 +2,7 @@ use std::io::SeekFrom;
 use std::path::Path;
 
 use chrono::DateTime;
+use codex_app_server_protocol::ThreadHistoryBuilder;
 use codex_app_server_protocol::ThreadHistoryChangeSet;
 use codex_app_server_protocol::project_rollout_line;
 use codex_protocol::ThreadId;
@@ -58,6 +59,9 @@ pub(super) async fn materialize_to_sqlite(
                 start_byte_offset: record.start_byte_offset,
                 end_byte_offset: record.end_byte_offset,
                 created_at_ms,
+                line_type: rollout_line_type(&record.line),
+                payload_type: rollout_payload_type(&record.line),
+                raw_json: serde_json::to_string(&record.line).map_err(thread_history_error)?,
                 changes,
             })
         })
@@ -70,6 +74,74 @@ pub(super) async fn materialize_to_sqlite(
         projections,
     )
     .await
+}
+
+/// One-time compatibility projection for pre-paginated rollouts. Legacy
+/// records have no ordinal, so their stable physical order becomes the
+/// PostgreSQL projection ordinal. The source JSONL is never rewritten.
+pub async fn materialize_legacy_to_postgres(
+    store: &LocalThreadStore,
+    thread_id: ThreadId,
+    rollout_path: &Path,
+) -> ThreadStoreResult<()> {
+    let start_offset = super::thread_history::next_rollout_byte_offset(store, thread_id).await?;
+    let (lines, next_offset) = read_complete_rollout_lines(rollout_path, start_offset).await?;
+    if lines.is_empty() && start_offset == next_offset {
+        return Ok(());
+    }
+    let next_ordinal = super::thread_history::next_rollout_ordinal(store, thread_id).await?;
+    let mut builder = ThreadHistoryBuilder::new();
+    let mut projections = Vec::with_capacity(lines.len());
+    for (index, record) in lines.iter().enumerate() {
+        let ordinal = next_ordinal
+            .checked_add(u64::try_from(index).map_err(thread_history_error)?)
+            .ok_or_else(|| ThreadStoreError::Internal {
+                message: "legacy rollout ordinal overflow".to_string(),
+            })?;
+        let created_at_ms = DateTime::parse_from_rfc3339(record.line.timestamp.as_str())
+            .map(|timestamp| timestamp.timestamp_millis())
+            .map_err(thread_history_error)?;
+        projections.push(ProjectedRolloutLine {
+            ordinal,
+            start_byte_offset: record.start_byte_offset,
+            end_byte_offset: record.end_byte_offset,
+            created_at_ms,
+            line_type: rollout_line_type(&record.line),
+            payload_type: rollout_payload_type(&record.line),
+            raw_json: serde_json::to_string(&record.line).map_err(thread_history_error)?,
+            changes: builder.handle_rollout_item_with_changes(&record.line.item),
+        });
+    }
+    super::thread_history::apply_projection(
+        store,
+        thread_id,
+        start_offset,
+        next_offset,
+        projections,
+    )
+    .await
+}
+
+fn rollout_line_type(line: &RolloutLine) -> String {
+    serde_json::to_value(line)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn rollout_payload_type(line: &RolloutLine) -> Option<String> {
+    serde_json::to_value(line).ok().and_then(|value| {
+        value
+            .get("payload")
+            .and_then(|payload| payload.get("type"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    })
 }
 
 async fn read_complete_rollout_lines(

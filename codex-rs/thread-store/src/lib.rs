@@ -20,6 +20,7 @@ pub use live_thread::LiveThread;
 pub use live_thread::LiveThreadInitGuard;
 pub use local::LocalThreadStore;
 pub use local::LocalThreadStoreConfig;
+pub use local::thread_history_materialization::materialize_legacy_to_postgres;
 pub use store::ThreadStore;
 pub use store::ThreadStoreFuture;
 pub use types::AppendThreadItemsParams;

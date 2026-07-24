@@ -1,12 +1,13 @@
 use super::*;
 use crate::SortDirection;
 use codex_protocol::protocol::SessionSource;
+use std::path::PathBuf;
 use std::sync::atomic::AtomicI64;
 use std::sync::atomic::Ordering;
 
 impl StateRuntime {
     pub async fn get_thread(&self, id: ThreadId) -> anyhow::Result<Option<crate::ThreadMetadata>> {
-        let row = sqlx::query(
+        let row = crate::db::query(
             r#"
 SELECT
     threads.id,
@@ -49,7 +50,7 @@ WHERE threads.id = ?
     }
 
     pub async fn get_thread_memory_mode(&self, id: ThreadId) -> anyhow::Result<Option<String>> {
-        let row = sqlx::query("SELECT memory_mode FROM threads WHERE id = ?")
+        let row = crate::db::query("SELECT memory_mode FROM threads WHERE id = ?")
             .bind(id.to_string())
             .fetch_optional(self.pool.as_ref())
             .await?;
@@ -65,7 +66,7 @@ WHERE threads.id = ?
         if preview.is_empty() {
             return Ok(false);
         }
-        let result = sqlx::query(
+        let result = crate::db::query(
             r#"
 UPDATE threads
 SET preview = ?
@@ -86,7 +87,7 @@ WHERE id = ? AND preview = ''
         child_thread_id: ThreadId,
         status: crate::DirectionalThreadSpawnEdgeStatus,
     ) -> anyhow::Result<()> {
-        sqlx::query(
+        crate::db::query(
             r#"
 INSERT INTO thread_spawn_edges (
     parent_thread_id,
@@ -112,7 +113,7 @@ ON CONFLICT(child_thread_id) DO UPDATE SET
         child_thread_id: ThreadId,
         status: crate::DirectionalThreadSpawnEdgeStatus,
     ) -> anyhow::Result<()> {
-        sqlx::query("UPDATE thread_spawn_edges SET status = ? WHERE child_thread_id = ?")
+        crate::db::query("UPDATE thread_spawn_edges SET status = ? WHERE child_thread_id = ?")
             .bind(status.as_ref())
             .bind(child_thread_id.to_string())
             .execute(self.pool.as_ref())
@@ -168,7 +169,7 @@ ON CONFLICT(child_thread_id) DO UPDATE SET
         parent_thread_id: ThreadId,
         agent_path: &str,
     ) -> anyhow::Result<Option<ThreadId>> {
-        let rows = sqlx::query(
+        let rows = crate::db::query(
             r#"
 SELECT threads.id
 FROM thread_spawn_edges
@@ -192,7 +193,7 @@ LIMIT 2
         root_thread_id: ThreadId,
         agent_path: &str,
     ) -> anyhow::Result<Option<ThreadId>> {
-        let rows = sqlx::query(
+        let rows = crate::db::query(
             r#"
 WITH RECURSIVE subtree(child_thread_id) AS (
     SELECT child_thread_id
@@ -223,7 +224,7 @@ LIMIT 2
         parent_thread_id: ThreadId,
         status: Option<crate::DirectionalThreadSpawnEdgeStatus>,
     ) -> anyhow::Result<Vec<ThreadId>> {
-        let mut builder = QueryBuilder::<Sqlite>::new(
+        let mut builder = QueryBuilder::new(
             "SELECT child_thread_id FROM thread_spawn_edges WHERE parent_thread_id = ",
         );
         builder.push_bind(parent_thread_id.to_string());
@@ -245,7 +246,7 @@ LIMIT 2
         root_thread_id: ThreadId,
         status: Option<crate::DirectionalThreadSpawnEdgeStatus>,
     ) -> anyhow::Result<Vec<ThreadId>> {
-        let mut builder = QueryBuilder::<Sqlite>::new(
+        let mut builder = QueryBuilder::new(
             r#"
 WITH RECURSIVE subtree(child_thread_id, depth) AS (
     SELECT child_thread_id, 1
@@ -299,7 +300,7 @@ ORDER BY depth ASC, child_thread_id ASC
         parent_thread_id: ThreadId,
         child_thread_id: ThreadId,
     ) -> anyhow::Result<()> {
-        sqlx::query(
+        crate::db::query(
             r#"
 INSERT INTO thread_spawn_edges (
     parent_thread_id,
@@ -335,8 +336,7 @@ ON CONFLICT(child_thread_id) DO NOTHING
         id: ThreadId,
         archived_only: Option<bool>,
     ) -> anyhow::Result<Option<PathBuf>> {
-        let mut builder =
-            QueryBuilder::<Sqlite>::new("SELECT rollout_path FROM threads WHERE id = ");
+        let mut builder = QueryBuilder::new("SELECT rollout_path FROM threads WHERE id = ");
         builder.push_bind(id.to_string());
         match archived_only {
             Some(true) => {
@@ -363,7 +363,7 @@ ON CONFLICT(child_thread_id) DO NOTHING
         archived_only: bool,
         cwd: Option<&Path>,
     ) -> anyhow::Result<Option<crate::ThreadMetadata>> {
-        let mut builder = QueryBuilder::<Sqlite>::new("");
+        let mut builder = QueryBuilder::new("");
         push_thread_select_columns(&mut builder);
         builder.push(" FROM threads");
         push_thread_filters(
@@ -445,7 +445,7 @@ ON CONFLICT(child_thread_id) DO NOTHING
     ) -> anyhow::Result<crate::ThreadsPage> {
         let limit = page_size.saturating_add(1);
 
-        let mut builder = QueryBuilder::<Sqlite>::new("");
+        let mut builder = QueryBuilder::new("");
         push_list_threads_query(&mut builder, filters, relation_filter, limit);
 
         let rows = builder.build().fetch_all(self.pool.as_ref()).await?;
@@ -490,7 +490,7 @@ ON CONFLICT(child_thread_id) DO NOTHING
         model_providers: Option<&[String]>,
         archived_only: bool,
     ) -> anyhow::Result<Vec<ThreadId>> {
-        let mut builder = QueryBuilder::<Sqlite>::new("SELECT threads.id FROM threads");
+        let mut builder = QueryBuilder::new("SELECT threads.id FROM threads");
         push_thread_filters(
             &mut builder,
             ThreadFilterOptions {
@@ -537,7 +537,7 @@ ON CONFLICT(child_thread_id) DO NOTHING
         let updated_at = self.allocate_thread_updated_at(metadata.updated_at)?;
         let recency_at = self.allocate_thread_recency_at(metadata.recency_at)?;
         let preview = metadata_preview(metadata);
-        let result = sqlx::query(
+        let result = crate::db::query(
             r#"
 INSERT INTO threads (
     id,
@@ -632,7 +632,7 @@ ON CONFLICT(id) DO NOTHING
         thread_id: ThreadId,
         memory_mode: &str,
     ) -> anyhow::Result<bool> {
-        let result = sqlx::query("UPDATE threads SET memory_mode = ? WHERE id = ?")
+        let result = crate::db::query("UPDATE threads SET memory_mode = ? WHERE id = ?")
             .bind(memory_mode)
             .bind(thread_id.to_string())
             .execute(self.pool.as_ref())
@@ -645,7 +645,7 @@ ON CONFLICT(id) DO NOTHING
         thread_id: ThreadId,
         title: &str,
     ) -> anyhow::Result<bool> {
-        let result = sqlx::query("UPDATE threads SET title = ? WHERE id = ?")
+        let result = crate::db::query("UPDATE threads SET title = ? WHERE id = ?")
             .bind(title)
             .bind(thread_id.to_string())
             .execute(self.pool.as_ref())
@@ -658,7 +658,7 @@ ON CONFLICT(id) DO NOTHING
         thread_id: ThreadId,
         name: Option<&str>,
     ) -> anyhow::Result<bool> {
-        let result = sqlx::query("UPDATE threads SET name = ? WHERE id = ?")
+        let result = crate::db::query("UPDATE threads SET name = ? WHERE id = ?")
             .bind(name)
             .bind(thread_id.to_string())
             .execute(self.pool.as_ref())
@@ -672,7 +672,7 @@ ON CONFLICT(id) DO NOTHING
         thread_id: ThreadId,
         is_pinned: bool,
     ) -> anyhow::Result<bool> {
-        let result = sqlx::query("UPDATE threads SET is_pinned = ? WHERE id = ?")
+        let result = crate::db::query("UPDATE threads SET is_pinned = ? WHERE id = ?")
             .bind(is_pinned)
             .bind(thread_id.to_string())
             .execute(self.pool.as_ref())
@@ -687,7 +687,7 @@ ON CONFLICT(id) DO NOTHING
     ) -> anyhow::Result<bool> {
         let updated_at = self.allocate_thread_updated_at(updated_at)?;
         let result =
-            sqlx::query("UPDATE threads SET updated_at = ?, updated_at_ms = ? WHERE id = ?")
+            crate::db::query("UPDATE threads SET updated_at = ?, updated_at_ms = ? WHERE id = ?")
                 .bind(datetime_to_epoch_seconds(updated_at))
                 .bind(datetime_to_epoch_millis(updated_at))
                 .bind(thread_id.to_string())
@@ -704,7 +704,7 @@ ON CONFLICT(id) DO NOTHING
         let recency_at = self.allocate_thread_recency_at(recency_at)?;
         let recency_at_seconds = datetime_to_epoch_seconds(recency_at);
         let recency_at_millis = datetime_to_epoch_millis(recency_at);
-        let result = sqlx::query(
+        let result = crate::db::query(
             r#"
 UPDATE threads
 SET
@@ -789,7 +789,7 @@ impl StateRuntime {
         git_branch: Option<Option<&str>>,
         git_origin_url: Option<Option<&str>>,
     ) -> anyhow::Result<bool> {
-        let result = sqlx::query(
+        let result = crate::db::query(
             r#"
 UPDATE threads
 SET
@@ -822,7 +822,7 @@ WHERE id = ?
         // Backfill/reconcile callers merge existing git info before upserting, but that
         // read/modify/write is not atomic. Preserve non-null SQLite git fields here so
         // an explicit metadata update cannot be lost if a stale rollout upsert lands later.
-        sqlx::query(
+        crate::db::query(
             r#"
 INSERT INTO threads (
     id,
@@ -1053,7 +1053,7 @@ ON CONFLICT(id) DO UPDATE SET
             .map(ThreadId::to_string)
             .collect::<Vec<_>>();
         for (thread_id, thread_id_string) in thread_ids.iter().zip(&thread_id_strings) {
-            sqlx::query("DELETE FROM logs WHERE thread_id = ?")
+            crate::db::query("DELETE FROM logs WHERE thread_id = ?")
                 .bind(thread_id_string)
                 .execute(self.logs_pool.as_ref())
                 .await?;
@@ -1063,13 +1063,13 @@ ON CONFLICT(id) DO UPDATE SET
 
         let mut tx = self.pool.begin().await?;
         for thread_id_string in &thread_id_strings {
-            sqlx::query("DELETE FROM thread_dynamic_tools WHERE thread_id = ?")
+            crate::db::query("DELETE FROM thread_dynamic_tools WHERE thread_id = ?")
                 .bind(thread_id_string)
                 .execute(&mut *tx)
                 .await?;
         }
         for thread_id_string in &thread_id_strings {
-            sqlx::query(
+            crate::db::query(
                 "DELETE FROM thread_spawn_edges WHERE parent_thread_id = ? OR child_thread_id = ?",
             )
             .bind(thread_id_string)
@@ -1079,7 +1079,7 @@ ON CONFLICT(id) DO UPDATE SET
         }
         let mut rows_affected = 0;
         for thread_id_string in &thread_id_strings {
-            rows_affected += sqlx::query("DELETE FROM threads WHERE id = ?")
+            rows_affected += crate::db::query("DELETE FROM threads WHERE id = ?")
                 .bind(thread_id_string)
                 .execute(&mut *tx)
                 .await?
@@ -1092,7 +1092,7 @@ ON CONFLICT(id) DO UPDATE SET
 }
 
 fn one_thread_id_from_rows(
-    rows: Vec<sqlx::sqlite::SqliteRow>,
+    rows: Vec<crate::db::Row>,
     agent_path: &str,
 ) -> anyhow::Result<Option<ThreadId>> {
     let mut ids = rows
@@ -1112,7 +1112,7 @@ fn one_thread_id_from_rows(
 }
 
 fn push_list_threads_query(
-    builder: &mut QueryBuilder<Sqlite>,
+    builder: &mut QueryBuilder,
     filters: ThreadFilterOptions<'_>,
     relation_filter: Option<crate::ThreadRelationFilter>,
     limit: usize,
@@ -1183,7 +1183,7 @@ WITH RECURSIVE subtree(child_thread_id, parent_thread_id) AS (
     );
 }
 
-pub(super) fn push_thread_select_columns(builder: &mut QueryBuilder<Sqlite>) {
+pub(super) fn push_thread_select_columns(builder: &mut QueryBuilder) {
     builder.push(
         r#"
 SELECT
@@ -1252,7 +1252,7 @@ pub struct ThreadFilterOptions<'a> {
 }
 
 pub(super) fn push_thread_filters<'a>(
-    builder: &mut QueryBuilder<Sqlite>,
+    builder: &mut QueryBuilder,
     options: ThreadFilterOptions<'a>,
     include_thread_id_tiebreaker: bool,
 ) {
@@ -1362,7 +1362,7 @@ pub(super) enum OrderByIndex {
 }
 
 pub(super) fn push_thread_order_and_limit(
-    builder: &mut QueryBuilder<Sqlite>,
+    builder: &mut QueryBuilder,
     sort_key: SortKey,
     sort_direction: SortDirection,
     order_by_index: OrderByIndex,
@@ -1441,7 +1441,7 @@ mod tests {
             .expect("initial insert should succeed");
 
         let memory_mode: String =
-            sqlx::query_scalar("SELECT memory_mode FROM threads WHERE id = ?")
+            crate::db::query_scalar("SELECT memory_mode FROM threads WHERE id = ?")
                 .bind(thread_id.to_string())
                 .fetch_one(runtime.pool.as_ref())
                 .await
@@ -1455,7 +1455,7 @@ mod tests {
             .expect("upsert should succeed");
 
         let memory_mode: String =
-            sqlx::query_scalar("SELECT memory_mode FROM threads WHERE id = ?")
+            crate::db::query_scalar("SELECT memory_mode FROM threads WHERE id = ?")
                 .bind(thread_id.to_string())
                 .fetch_one(runtime.pool.as_ref())
                 .await
@@ -1634,7 +1634,7 @@ mod tests {
             vec![newest_unpinned, oldest_unpinned]
         );
 
-        let mut builder = QueryBuilder::<Sqlite>::new("EXPLAIN QUERY PLAN ");
+        let mut builder = QueryBuilder::new("EXPLAIN QUERY PLAN ");
         push_list_threads_query(
             &mut builder,
             filters(None, true),
@@ -1681,7 +1681,7 @@ mod tests {
             ))
             .await?;
         seed_thread_cleanup_state(&runtime, thread_id, child_thread_id).await?;
-        sqlx::query("INSERT INTO thread_dynamic_tools (thread_id, position, name, description, input_schema) VALUES (?, ?, ?, ?, ?)")
+        crate::db::query("INSERT INTO thread_dynamic_tools (thread_id, position, name, description, input_schema) VALUES (?, ?, ?, ?, ?)")
         .bind(thread_id.to_string())
         .bind(0_i64)
         .bind("test_tool")
@@ -1695,11 +1695,12 @@ mod tests {
 
         assert_eq!(rows, 1);
         assert!(runtime.get_thread(thread_id).await?.is_none());
-        let dynamic_tool_count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM thread_dynamic_tools WHERE thread_id = ?")
-                .bind(thread_id.to_string())
-                .fetch_one(runtime.pool.as_ref())
-                .await?;
+        let dynamic_tool_count: i64 = crate::db::query_scalar(
+            "SELECT COUNT(*) FROM thread_dynamic_tools WHERE thread_id = ?",
+        )
+        .bind(thread_id.to_string())
+        .fetch_one(runtime.pool.as_ref())
+        .await?;
         assert_eq!(dynamic_tool_count, 0);
         assert_thread_cleanup_state(&runtime, thread_id).await?;
 
@@ -1767,7 +1768,7 @@ mod tests {
                 /*token_budget*/ None,
             )
             .await?;
-        sqlx::query("INSERT INTO logs (ts, ts_nanos, level, target, feedback_log_body, thread_id) VALUES (1, 0, 'INFO', 'test', 'feedback log', ?)")
+        crate::db::query("INSERT INTO logs (ts, ts_nanos, level, target, feedback_log_body, thread_id) VALUES (1, 0, 'INFO', 'test', 'feedback log', ?)")
             .bind(thread_id.to_string())
             .execute(runtime.logs_pool.as_ref())
             .await?;
@@ -1778,7 +1779,7 @@ mod tests {
         runtime: &StateRuntime,
         thread_id: ThreadId,
     ) -> Result<()> {
-        let spawn_edge_count: i64 = sqlx::query_scalar(
+        let spawn_edge_count: i64 = crate::db::query_scalar(
             "SELECT COUNT(*) FROM thread_spawn_edges WHERE parent_thread_id = ? OR child_thread_id = ?",
         )
         .bind(thread_id.to_string())
@@ -2052,7 +2053,7 @@ mod tests {
                 ),
                 (Some(&cwd_filters[..]), Some(&anchor), cwd_index, true),
             ] {
-                let mut builder = QueryBuilder::<Sqlite>::new("EXPLAIN QUERY PLAN ");
+                let mut builder = QueryBuilder::new("EXPLAIN QUERY PLAN ");
                 push_list_threads_query(
                     &mut builder,
                     ThreadFilterOptions {
@@ -2149,7 +2150,7 @@ mod tests {
                 .expect("spawn edge insert should succeed");
         }
 
-        let mut builder = QueryBuilder::<Sqlite>::new("EXPLAIN QUERY PLAN ");
+        let mut builder = QueryBuilder::new("EXPLAIN QUERY PLAN ");
         push_list_threads_query(
             &mut builder,
             ThreadFilterOptions {
@@ -2587,7 +2588,7 @@ mod tests {
         let updated_at = datetime_to_epoch_millis(
             DateTime::<Utc>::from_timestamp(1_700_000_100, 0).expect("timestamp"),
         );
-        sqlx::query(
+        crate::db::query(
             "UPDATE threads SET updated_at = ?, updated_at_ms = ?, tokens_used = ?, first_user_message = ?, preview = ? WHERE id = ?",
         )
         .bind(updated_at / 1000)
@@ -2849,7 +2850,7 @@ mod tests {
                 .await
                 .expect("thread insert should succeed");
         }
-        sqlx::query("UPDATE threads SET recency_at = ?, recency_at_ms = ?")
+        crate::db::query("UPDATE threads SET recency_at = ?, recency_at_ms = ?")
             .bind(datetime_to_epoch_seconds(recency_at))
             .bind(datetime_to_epoch_millis(recency_at))
             .execute(runtime.pool.as_ref())
@@ -3009,7 +3010,7 @@ mod tests {
             datetime_to_epoch_millis(second.recency_at),
             1_700_001_111_124
         );
-        let second_row: (i64, i64, Option<i64>, Option<i64>) = sqlx::query_as(
+        let second_row: (i64, i64, Option<i64>, Option<i64>) = crate::db::query_as(
             "SELECT created_at, updated_at, created_at_ms, updated_at_ms FROM threads WHERE id = ?",
         )
         .bind(second_id.to_string())
@@ -3044,7 +3045,7 @@ mod tests {
             1_700_001_100_123
         );
 
-        sqlx::query("UPDATE threads SET updated_at = ? WHERE id = ?")
+        crate::db::query("UPDATE threads SET updated_at = ? WHERE id = ?")
             .bind(1_700_001_112_i64)
             .bind(first_id.to_string())
             .execute(runtime.pool.as_ref())
@@ -3257,7 +3258,7 @@ mod tests {
             )
             .await
             .expect("closed child edge insert should succeed");
-        sqlx::query(
+        crate::db::query(
             r#"
 INSERT INTO thread_spawn_edges (
     parent_thread_id,

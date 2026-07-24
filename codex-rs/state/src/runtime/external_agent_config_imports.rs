@@ -49,7 +49,7 @@ impl StateRuntime {
         successes: &[ExternalAgentConfigImportSuccessRecord],
         failures: &[ExternalAgentConfigImportFailureRecord],
     ) -> anyhow::Result<()> {
-        sqlx::query(
+        crate::db::query(
             r#"
 INSERT INTO external_agent_config_imports (
     import_id,
@@ -80,7 +80,7 @@ ON CONFLICT(import_id) DO UPDATE SET
         &self,
         import_id: &str,
     ) -> anyhow::Result<Option<ExternalAgentConfigImportDetailsRecord>> {
-        let row = sqlx::query(
+        let row = crate::db::query(
             r#"
 SELECT
     successes,
@@ -107,7 +107,7 @@ WHERE import_id = ?
     pub async fn external_agent_config_import_history_records(
         &self,
     ) -> anyhow::Result<Vec<ExternalAgentConfigImportHistoryRecord>> {
-        let rows = sqlx::query(
+        let rows = crate::db::query(
             r#"
 SELECT
     import_id,

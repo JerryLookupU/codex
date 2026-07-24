@@ -518,21 +518,21 @@ mod tests {
         .await
         .expect("open thread history db");
         let thread_id_string = thread_id.to_string();
-        sqlx::query(
+        codex_state::db::query(
             "INSERT INTO thread_turns (thread_id, turn_id, rollout_ordinal, status) VALUES (?, 'turn-1', 1, 'completed')",
         )
         .bind(thread_id_string.as_str())
         .execute(&pool)
         .await
         .expect("insert turn");
-        sqlx::query(
+        codex_state::db::query(
             "INSERT INTO thread_items (thread_id, turn_id, item_id, rollout_ordinal, created_at_ms, item_json) VALUES (?, 'turn-1', 'item-1', 2, 1, '{}')",
         )
         .bind(thread_id_string.as_str())
         .execute(&pool)
         .await
         .expect("insert item");
-        sqlx::query(
+        codex_state::db::query(
             "INSERT INTO thread_history_projection_state (thread_id, next_rollout_byte_offset, next_rollout_ordinal) VALUES (?, 3, 3)",
         )
         .bind(thread_id_string.as_str())

@@ -1,8 +1,8 @@
+use crate::db::Row as DbRow;
 use anyhow::Result;
 use chrono::DateTime;
 use chrono::Utc;
 use sqlx::Row;
-use sqlx::sqlite::SqliteRow;
 
 /// Persisted lifecycle state for rollout metadata backfill.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,7 +26,7 @@ impl Default for BackfillState {
 }
 
 impl BackfillState {
-    pub(crate) fn try_from_row(row: &SqliteRow) -> Result<Self> {
+    pub(crate) fn try_from_row(row: &DbRow) -> Result<Self> {
         let status: String = row.try_get("status")?;
         let last_success_at = row
             .try_get::<Option<i64>, _>("last_success_at")?

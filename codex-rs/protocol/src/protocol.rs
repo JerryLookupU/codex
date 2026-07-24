@@ -2194,6 +2194,7 @@ impl FromStr for RateLimitReachedType {
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema, TS)]
 pub struct RateLimitWindow {
     /// Percentage (0-100) of the window that has been consumed.
+    #[serde(deserialize_with = "deserialize_arbitrary_precision_f64")]
     pub used_percent: f64,
     /// Rolling window duration, in minutes.
     #[ts(type = "number | null")]
@@ -2201,6 +2202,50 @@ pub struct RateLimitWindow {
     /// Unix timestamp (seconds since epoch) when the window resets.
     #[ts(type = "number | null")]
     pub resets_at: Option<i64>,
+}
+
+fn deserialize_arbitrary_precision_f64<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct F64Visitor;
+
+    impl<'de> serde::de::Visitor<'de> for F64Visitor {
+        type Value = f64;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a floating-point number")
+        }
+
+        fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E> {
+            Ok(value)
+        }
+
+        fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+            Ok(value as f64)
+        }
+
+        fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+            Ok(value as f64)
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::MapAccess<'de>,
+        {
+            let Some((key, value)) = map.next_entry::<String, String>()? else {
+                return Err(serde::de::Error::custom("empty arbitrary-precision number"));
+            };
+            if key != "$serde_json::private::Number" || map.next_key::<String>()?.is_some() {
+                return Err(serde::de::Error::custom(
+                    "invalid arbitrary-precision number representation",
+                ));
+            }
+            value.parse::<f64>().map_err(serde::de::Error::custom)
+        }
+    }
+
+    deserializer.deserialize_any(F64Visitor)
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema, TS)]

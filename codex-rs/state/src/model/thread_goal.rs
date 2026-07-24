@@ -1,3 +1,4 @@
+use crate::db::Row as DbRow;
 use anyhow::Result;
 use anyhow::anyhow;
 use chrono::DateTime;
@@ -5,7 +6,6 @@ use chrono::Utc;
 use codex_protocol::ThreadId;
 use serde::Serialize;
 use sqlx::Row;
-use sqlx::sqlite::SqliteRow;
 
 use super::epoch_millis_to_datetime;
 
@@ -83,7 +83,7 @@ pub(crate) struct ThreadGoalRow {
 }
 
 impl ThreadGoalRow {
-    pub(crate) fn try_from_row(row: &SqliteRow) -> Result<Self> {
+    pub(crate) fn try_from_row(row: &DbRow) -> Result<Self> {
         Ok(Self {
             thread_id: row.try_get("thread_id")?,
             goal_id: row.try_get("goal_id")?,

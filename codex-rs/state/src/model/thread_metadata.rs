@@ -1,3 +1,4 @@
+use crate::db::Row as DbRow;
 use anyhow::Result;
 use chrono::DateTime;
 use chrono::Utc;
@@ -9,7 +10,6 @@ use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadSource;
 use sqlx::Row;
-use sqlx::sqlite::SqliteRow;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -424,7 +424,7 @@ pub(crate) struct ThreadRow {
 }
 
 impl ThreadRow {
-    pub(crate) fn try_from_row(row: &SqliteRow) -> Result<Self> {
+    pub(crate) fn try_from_row(row: &DbRow) -> Result<Self> {
         Ok(Self {
             id: row.try_get("id")?,
             rollout_path: row.try_get("rollout_path")?,

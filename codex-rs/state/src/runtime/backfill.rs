@@ -3,7 +3,7 @@ use super::*;
 impl StateRuntime {
     pub async fn get_backfill_state(&self) -> anyhow::Result<crate::BackfillState> {
         self.ensure_backfill_state_row().await?;
-        let row = sqlx::query(
+        let row = crate::db::query(
             r#"
 SELECT status, last_watermark, last_success_at
 FROM backfill_state
@@ -24,7 +24,7 @@ WHERE id = 1
         self.ensure_backfill_state_row().await?;
         let now = Utc::now().timestamp();
         let lease_cutoff = now.saturating_sub(lease_seconds.max(0));
-        let result = sqlx::query(
+        let result = crate::db::query(
             r#"
 UPDATE backfill_state
 SET status = ?, updated_at = ?
@@ -46,7 +46,7 @@ WHERE id = 1
     /// Mark rollout metadata backfill as running.
     pub async fn mark_backfill_running(&self) -> anyhow::Result<()> {
         self.ensure_backfill_state_row().await?;
-        sqlx::query(
+        crate::db::query(
             r#"
 UPDATE backfill_state
 SET status = ?, updated_at = ?
@@ -63,7 +63,7 @@ WHERE id = 1
     /// Persist rollout metadata backfill progress.
     pub async fn checkpoint_backfill(&self, watermark: &str) -> anyhow::Result<()> {
         self.ensure_backfill_state_row().await?;
-        sqlx::query(
+        crate::db::query(
             r#"
 UPDATE backfill_state
 SET status = ?, last_watermark = ?, updated_at = ?
@@ -82,7 +82,7 @@ WHERE id = 1
     pub async fn mark_backfill_complete(&self, last_watermark: Option<&str>) -> anyhow::Result<()> {
         self.ensure_backfill_state_row().await?;
         let now = Utc::now().timestamp();
-        sqlx::query(
+        crate::db::query(
             r#"
 UPDATE backfill_state
 SET
@@ -211,7 +211,7 @@ mod tests {
         )
         .await
         .expect("initialize runtime");
-        sqlx::query("DELETE FROM backfill_state WHERE id = 1")
+        crate::db::query("DELETE FROM backfill_state WHERE id = 1")
             .execute(runtime.pool.as_ref())
             .await
             .expect("delete backfill state row");
@@ -254,7 +254,7 @@ mod tests {
         assert_eq!(duplicate_claim, false);
 
         let stale_updated_at = Utc::now().timestamp().saturating_sub(10_000);
-        sqlx::query(
+        crate::db::query(
             r#"
 UPDATE backfill_state
 SET status = ?, updated_at = ?

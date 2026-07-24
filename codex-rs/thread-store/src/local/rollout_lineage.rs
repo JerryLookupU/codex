@@ -33,6 +33,11 @@ impl LocalThreadStore {
         &self,
         requested_thread_id: ThreadId,
     ) -> ThreadStoreResult<RolloutLineage> {
+        if self.postgres_canonical() {
+            return self
+                .resolve_postgres_rollout_lineage(requested_thread_id)
+                .await;
+        }
         let mut segments = Vec::new();
         let mut seen = HashSet::new();
         let mut thread_id = requested_thread_id;
@@ -86,6 +91,89 @@ impl LocalThreadStore {
         Ok(RolloutLineage { segments })
     }
 
+    async fn resolve_postgres_rollout_lineage(
+        &self,
+        requested_thread_id: ThreadId,
+    ) -> ThreadStoreResult<RolloutLineage> {
+        let mut segments = Vec::new();
+        let mut seen = HashSet::new();
+        let mut thread_id = requested_thread_id;
+        let mut end = None;
+
+        loop {
+            if !seen.insert(thread_id) {
+                return Err(malformed_lineage(requested_thread_id, "cycle detected"));
+            }
+            let meta = super::thread_history::load_session_meta(self, thread_id)
+                .await?
+                .ok_or_else(|| {
+                    malformed_lineage(thread_id, "missing PostgreSQL session metadata")
+                })?;
+            if meta.meta.id != thread_id {
+                return Err(malformed_lineage(
+                    requested_thread_id,
+                    "source history belongs to another thread",
+                ));
+            }
+            if meta.meta.history_mode != ThreadHistoryMode::Paginated {
+                return Err(malformed_lineage(
+                    requested_thread_id,
+                    "source history is not paginated",
+                ));
+            }
+            if let Some(end) = end {
+                self.validate_postgres_cutoff_bounds(requested_thread_id, thread_id, &end)
+                    .await?;
+            }
+            segments.push(RolloutLineageSegment {
+                thread_id,
+                rollout_path: PathBuf::new(),
+                end,
+            });
+
+            let Some(base) = meta.meta.history_base else {
+                break;
+            };
+            thread_id = base.thread_id;
+            end = Some(base);
+        }
+
+        segments.reverse();
+        Ok(RolloutLineage { segments })
+    }
+
+    async fn validate_postgres_cutoff_bounds(
+        &self,
+        requested_thread_id: ThreadId,
+        physical_thread_id: ThreadId,
+        end: &HistoryPosition,
+    ) -> ThreadStoreResult<()> {
+        if end.end_ordinal_exclusive == 0 {
+            return Err(malformed_lineage(
+                requested_thread_id,
+                "cutoff cannot include source session metadata",
+            ));
+        }
+        let pool = self.thread_history_db().await?;
+        let next_ordinal = codex_state::db::query_scalar::<i64>(
+            "SELECT next_rollout_ordinal FROM thread_history_projection_state WHERE thread_id = ?",
+        )
+        .bind(physical_thread_id.to_string())
+        .fetch_optional(pool)
+        .await
+        .map_err(|err| ThreadStoreError::Internal {
+            message: format!("failed to read PostgreSQL lineage bounds: {err}"),
+        })?
+        .ok_or_else(|| malformed_lineage(physical_thread_id, "missing projection state"))?;
+        if end.end_ordinal_exclusive > u64::try_from(next_ordinal).unwrap_or(0) {
+            return Err(malformed_lineage(
+                requested_thread_id,
+                "cutoff ordinal is past the source history",
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) async fn resolve_rollout_lineage_at(
         &self,
         end: HistoryPosition,
@@ -96,7 +184,12 @@ impl LocalThreadStore {
                 message: "rollout lineage has no segments".to_string(),
             });
         };
-        validate_cutoff_bounds(end.thread_id, segment.rollout_path.as_path(), &end).await?;
+        if self.postgres_canonical() {
+            self.validate_postgres_cutoff_bounds(end.thread_id, segment.thread_id, &end)
+                .await?;
+        } else {
+            validate_cutoff_bounds(end.thread_id, segment.rollout_path.as_path(), &end).await?;
+        }
         segment.end = Some(end);
         Ok(lineage)
     }
